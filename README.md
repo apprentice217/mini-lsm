@@ -105,17 +105,28 @@ db->ReleaseSnapshot(snap);
 
 ## Benchmark 结果
 
-测试配置：100,000 条记录，Key = 16 字节，Value = 100 字节，batch size = 1000，sync = false
+测试配置：100,000 条记录，Key = 16 字节，Value = 100 字节，batch size = 1000，sync = false，Bloom Filter（10 bits/key）
 
 | 测试项 | 耗时（micros/op） | 吞吐（ops/sec） | 数据量（MB/s） |
 |--------|-----------------|----------------|--------------|
-| FillSeq（顺序写） | 764 | 1,309 | 0.1 |
-| ReadRandom（随机读） | 88 | 11,398 | 1.3 |
-| FillRandom（随机写） | 431 | 2,319 | 0.3 |
+| FillSeq（顺序写） | 156 | 6,394 | 0.7 |
+| ReadRandom（随机读） | 18 | 56,022 | 6.2 |
+| FillRandom（随机写） | 112 | 8,893 | 1.0 |
 
-随机读命中率：99,995 / 100,000
+随机读命中率：99,998 / 100,000
 
-> 测试环境：Linux 6.8，单线程，Debug 构建（Release 性能更优）
+> 测试环境：Linux 6.8，单线程，Release 构建（-O2）
+
+### 性能优化说明
+
+相较于初始版本（Debug 构建，无 Bloom Filter），Release 版本包含以下四项优化：
+
+| 优化项 | 说明 |
+|--------|------|
+| WritableFile 64KB 写缓冲 | 将 `write(2)` 系统调用从 O(每条 record) 降低到 O(每 64KB)，批量落盘 |
+| MemTable 零分配编码 | `EncodeVarint32` 直接写入 Arena buffer，消除两次临时 `std::string` 堆分配 |
+| SSTable mmap 零拷贝读 | `mmap(PROT_READ) + MADV_RANDOM`，Data Block 读取无需从 Page Cache 拷贝到用户态 scratch |
+| Data Block 4KB→16KB + Bloom Filter | 更大的 Block 减少 Index 条目和 pread 次数；Bloom Filter（误报率 ~1%）跳过 99% 的无关 Data Block |
 
 ## 当前实现范围
 
