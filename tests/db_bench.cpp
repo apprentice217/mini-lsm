@@ -8,6 +8,7 @@
 #include <cassert>
 #include "db.h"
 #include "options.h"
+#include "filter_policy.h"
 #include "write_batch.h"
 
 using namespace minidb;
@@ -73,8 +74,12 @@ int main() {
     const size_t bytes_per_op = key_size + value_size;
     const size_t total_bytes = num_entries * bytes_per_op;
 
+    // 10 bits/key → 误报率约 1%；开启后随机读可跳过 ~99% 的无关 Data Block 磁盘读。
+    const minidb::FilterPolicy* bloom = minidb::NewBloomFilterPolicy(10);
+
     Options options;
     options.create_if_missing = true;
+    options.filter_policy     = bloom;
     std::string db_name = "./bench_test_db";
 
     DB* db = nullptr;
@@ -167,6 +172,7 @@ int main() {
     PrintStats("fillrandom", num_entries, timer.GetSeconds(), total_bytes);
 
     delete db;
+    delete bloom;
     std::cout << "=== Benchmark Completed ===" << std::endl;
 
     return 0;

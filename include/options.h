@@ -11,6 +11,7 @@ struct Options {
     bool   create_if_missing  = false;
     size_t write_buffer_size  = 4 * 1024 * 1024; // MemTable 大小阈值，超过后触发 flush
     int    block_restart_interval = 16;           // Block 前缀压缩重启点间隔
+    size_t block_size = 16 * 1024;                // Data Block 目标大小（默认 16KB）
 
     const Comparator*  comparator    = BytewiseComparator();
     const FilterPolicy* filter_policy = nullptr;

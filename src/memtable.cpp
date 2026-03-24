@@ -9,8 +9,8 @@ namespace minidb {
 // 从 Arena 分配的节点首地址读取长度前缀，并返回其后紧跟的数据 Slice。
 // 节点内存布局：[varint32: internal_key_size][internal_key][varint32: val_size][val]
 static const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* value) {
-    bool result = GetVarint32(&p, limit, value);
-    assert(result);
+    [[maybe_unused]] bool ok = GetVarint32(&p, limit, value);
+    assert(ok);
     return p;
 }
 
@@ -88,13 +88,9 @@ void MemTable::Add(uint64_t seq, char type, const Slice& key, const Slice& value
     char* buf = arena_.AllocateAligned(encoded_len);
     char* p   = buf;
 
-    // 写入 InternalKey 长度前缀
-    std::string tmp;
-    PutVarint32(&tmp, static_cast<uint32_t>(internal_key_size));
-    memcpy(p, tmp.data(), tmp.size());
-    p += tmp.size();
+    // 直接将 varint 编码写入目标 buffer，避免经由临时 std::string 中转。
+    p = EncodeVarint32(p, static_cast<uint32_t>(internal_key_size));
 
-    // 写入 UserKey
     memcpy(p, key.data(), key_size);
     p += key_size;
 
@@ -103,11 +99,7 @@ void MemTable::Add(uint64_t seq, char type, const Slice& key, const Slice& value
     EncodeFixed64(p, packed);
     p += 8;
 
-    // 写入 Value 长度前缀和 Value
-    tmp.clear();
-    PutVarint32(&tmp, static_cast<uint32_t>(val_size));
-    memcpy(p, tmp.data(), tmp.size());
-    p += tmp.size();
+    p = EncodeVarint32(p, static_cast<uint32_t>(val_size));
     memcpy(p, value.data(), val_size);
 
     table_.Insert(buf);

@@ -11,6 +11,18 @@ int VarintLength(uint64_t v) {
     return len;
 }
 
+// EncodeVarint32 将 v 直接写入 dst 指向的内存，返回写入后的新指针。
+// 与 PutVarint32 不同，无需经过 std::string 中转，适合写入 Arena 分配的 buffer。
+char* EncodeVarint32(char* dst, uint32_t v) {
+    auto* ptr = reinterpret_cast<uint8_t*>(dst);
+    while (v >= 128) {
+        *(ptr++) = static_cast<uint8_t>((v & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    *(ptr++) = static_cast<uint8_t>(v);
+    return reinterpret_cast<char*>(ptr);
+}
+
 void PutVarint32(std::string* dst, uint32_t v) {
     // 32位整数最多被编码为 5 个字节 (32 / 7 = 4.5)
     char buf[5];

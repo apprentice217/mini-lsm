@@ -10,8 +10,8 @@
 
 namespace minidb {
 
-// Data Block 的目标大小阈值，超过后触发 Flush 切块。
-static const size_t kBlockSizeThreshold = 4096;
+// Data Block 默认大小，实际以 options.block_size 为准。
+static const size_t kDefaultBlockSize = 16 * 1024;
 
 TableBuilder::TableBuilder(const Options& options, WritableFile* file)
     : options_(options),
@@ -71,7 +71,9 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
     num_entries_++;
     data_block_->Add(key, value);
 
-    if (data_block_->CurrentSizeEstimate() >= kBlockSizeThreshold) {
+    // 使用 options_.block_size 作为切块阈值，允许调用方按场景调整。
+    size_t threshold = (options_.block_size > 0) ? options_.block_size : kDefaultBlockSize;
+    if (data_block_->CurrentSizeEstimate() >= threshold) {
         Flush();
     }
 }

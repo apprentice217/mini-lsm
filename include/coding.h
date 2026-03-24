@@ -72,6 +72,9 @@ inline void PutFixed64(std::string* dst, uint64_t value) {
 void PutVarint32(std::string* dst, uint32_t v);
 void PutVarint64(std::string* dst, uint64_t v);
 
+// EncodeVarint32 将 v 编码为 varint，写入 dst，返回写入后的指针（不经过 std::string）。
+char* EncodeVarint32(char* dst, uint32_t v);
+
 // 核心解码契约 (TLV 游走法)：
 // 从 *p 开始解析，最多解析到 limit 之前。
 // 如果解析成功，将值写入 *value，并将 *p 向前推进到下一个数据的起始位置，返回 true。
