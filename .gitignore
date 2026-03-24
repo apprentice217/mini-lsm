@@ -1,0 +1,25 @@
+# Build output
+build/
+*.o
+*.a
+*.so
+
+# Runtime database files
+bench_test_db/
+testdb/
+*.sst
+*.log
+MANIFEST-*
+CURRENT
+CURRENT.tmp
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Misc
+gh_cli
+.gh_config/
