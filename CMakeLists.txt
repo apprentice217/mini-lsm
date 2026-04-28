@@ -55,6 +55,10 @@ target_compile_definitions(db_bench PRIVATE
     MINIDB_GIT_HASH="${MINIDB_GIT_HASH}"
 )
 
+add_executable(db_correctness tests/db_correctness.cpp)
+target_link_libraries(db_correctness minidb)
+
 
 # 注册测试用例，方便以后使用 make test 或 ctest 批量运行
 add_test(NAME db_bench COMMAND db_bench)
+add_test(NAME db_correctness COMMAND db_correctness)
