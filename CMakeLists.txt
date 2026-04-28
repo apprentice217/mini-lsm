@@ -58,7 +58,11 @@ target_compile_definitions(db_bench PRIVATE
 add_executable(db_correctness tests/db_correctness.cpp)
 target_link_libraries(db_correctness minidb)
 
+add_executable(db_bench_mt tests/db_bench_mt.cpp)
+target_link_libraries(db_bench_mt minidb)
+
 
 # 注册测试用例，方便以后使用 make test 或 ctest 批量运行
 add_test(NAME db_bench COMMAND db_bench)
 add_test(NAME db_correctness COMMAND db_correctness)
+add_test(NAME db_bench_mt COMMAND db_bench_mt)
