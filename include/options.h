@@ -21,6 +21,9 @@ struct Options {
     // 每个 Level（L1+）允许的最大总字节数（字节）。
     // L1: 10MB, L2: 100MB, L3: 1GB ...（每级 ×10）
     int64_t max_bytes_for_level_base = 10 * 1024 * 1024;
+
+    // 仅用于实验：关闭自动 level compaction（不影响 memtable flush）。
+    bool disable_auto_compaction = false;
 };
 
 struct ReadOptions {

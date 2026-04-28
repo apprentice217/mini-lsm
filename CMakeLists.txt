@@ -64,9 +64,13 @@ target_link_libraries(db_bench_mt minidb)
 add_executable(memtable_ds_bench tests/memtable_ds_bench.cpp)
 target_link_libraries(memtable_ds_bench minidb)
 
+add_executable(compaction_ab_bench tests/compaction_ab_bench.cpp)
+target_link_libraries(compaction_ab_bench minidb)
+
 
 # 注册测试用例，方便以后使用 make test 或 ctest 批量运行
 add_test(NAME db_bench COMMAND db_bench)
 add_test(NAME db_correctness COMMAND db_correctness)
 add_test(NAME db_bench_mt COMMAND db_bench_mt)
 add_test(NAME memtable_ds_bench COMMAND memtable_ds_bench)
+add_test(NAME compaction_ab_bench COMMAND compaction_ab_bench)

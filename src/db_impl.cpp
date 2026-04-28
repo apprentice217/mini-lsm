@@ -301,8 +301,8 @@ void DBImpl::BackgroundCompaction() {
         }
     }
 
-    // 若 flush 后仍触发 compaction 条件（如 L0 文件数超阈值），执行 SSTable 级归并。
-    if (versions_->NeedsCompaction()) {
+    // 若未禁用自动 compaction 且 flush 后仍触发条件，执行 SSTable 级归并。
+    if (!options_.disable_auto_compaction && versions_->NeedsCompaction()) {
         Compaction* c = versions_->PickCompaction();
         if (c != nullptr) {
             Status s = RunCompaction(c);
