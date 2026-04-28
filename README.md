@@ -81,6 +81,43 @@ make -j4
 ./db_bench
 ```
 
+## 测试与实验
+
+当前仓库已提供 5 类可直接运行的测试/基准程序，用于回答“高并发阈值、数据结构选型、compaction 收益”这类项目深问。
+
+```bash
+# 1) 参数化单线程基线（含环境信息与 CSV 落盘）
+./build/db_bench --num_entries=100000 --batch_size=1000 --output_csv=./benchmark_results.csv
+
+# 2) 正确性回归（WriteBatch 与覆盖写语义）
+./build/db_correctness
+
+# 3) 多线程并发写压测（输出吞吐 + p50/p95/p99）
+./build/db_bench_mt --threads=1 --ops_per_thread=5000 --db_name=./bench_mt_t1
+./build/db_bench_mt --threads=4 --ops_per_thread=5000 --db_name=./bench_mt_t4
+./build/db_bench_mt --threads=8 --ops_per_thread=5000 --db_name=./bench_mt_t8
+
+# 4) SkipList vs 红黑树（std::map）微基准
+./build/memtable_ds_bench --n=200000 --lookup=100000 --seed=42
+
+# 5) Compaction A/B 对比实验
+./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=./bench_compaction_ab
+```
+
+也可以统一通过 CTest 执行：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+### 新增实验开关
+
+`Options` 增加了实验用字段：
+
+- `disable_auto_compaction`：关闭自动 level compaction（不影响 memtable flush），用于 compaction on/off A/B 对比。
+
+该开关仅建议用于实验，不建议作为默认线上配置。
+
 ## 公共接口
 
 ```cpp
@@ -139,6 +176,16 @@ db->ReleaseSnapshot(snap);
 - Snapshot 隔离读（GetSnapshot / ReleaseSnapshot）
 - Bloom Filter、前缀压缩、CRC32c 校验
 - 后台 flush 线程、背压机制、LRU Table Cache
+- 参数化 benchmark（环境信息打印 + CSV 结果落盘）
+- 多线程并发写基准（吞吐 + p50/p95/p99）
+- SkipList vs 红黑树微基准
+- Compaction on/off A/B 对比基准
+- 基础正确性回归测试（`db_correctness`）
+- 参数化 benchmark（环境信息打印 + CSV 结果落盘）
+- 多线程并发写基准（吞吐 + p50/p95/p99）
+- SkipList vs 红黑树微基准
+- Compaction on/off A/B 对比基准
+- 基础正确性回归测试（`db_correctness`）
 
 **计划中（TODO）**：
 - 压缩（Snappy/zstd）Block 数据
