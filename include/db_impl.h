@@ -44,6 +44,8 @@ private:
     // 若内存已满，执行 double-buffer 翻转并唤醒后台 flush 线程；
     // 若 imm_ 尚未 flush 完毕，阻塞前台线程（背压机制）。
     Status MakeRoomForWrite(std::unique_lock<std::mutex>& lock);
+    // 在持锁状态下检查是否有后台工作（flush 或 compaction），并在需要时唤醒后台线程。
+    void MaybeScheduleCompaction();
 
     void   BackgroundCall();
     void   BackgroundCompaction();

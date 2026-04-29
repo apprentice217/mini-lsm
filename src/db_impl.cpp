@@ -134,6 +134,12 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
 
     // 后台线程常驻，负责将 immutable MemTable flush 为 SSTable 或执行 Level Compaction。
     bg_thread_ = std::thread(&DBImpl::BackgroundCall, this);
+    // 若恢复后目录中已满足 compaction 条件（例如历史遗留 L0 文件过多），
+    // 即使没有新的写入也要主动触发后台处理。
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        MaybeScheduleCompaction();
+    }
 }
 
 DBImpl::~DBImpl() {
@@ -260,13 +266,22 @@ Status DBImpl::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {
 
             imm_ = mem_;
             mem_ = new MemTable(&internal_comparator_);
-
-            if (!bg_compaction_scheduled_) {
-                bg_compaction_scheduled_ = true;
-                bg_cv_.notify_all();
-            }
+            MaybeScheduleCompaction();
         }
     }
+}
+
+void DBImpl::MaybeScheduleCompaction() {
+    // 约定：调用方必须持有 mutex_。
+    if (bg_compaction_scheduled_ || shutting_down_) return;
+    // imm_ 不为空时必须优先 flush；imm_ 为空时仅在需要且允许自动 compaction 时调度。
+    if (imm_ == nullptr) {
+        if (options_.disable_auto_compaction || !versions_->NeedsCompaction()) {
+            return;
+        }
+    }
+    bg_compaction_scheduled_ = true;
+    bg_cv_.notify_all();
 }
 
 // BackgroundCall 在独立线程中运行，等待调度信号后执行 flush 或 compaction。
@@ -278,8 +293,15 @@ void DBImpl::BackgroundCall() {
         }
         if (shutting_down_) break;
 
-        BackgroundCompaction();
+        // 先消费当前调度令牌；BackgroundCompaction 结束后再按最新状态决定是否继续调度，
+        // 避免覆盖前台线程在 I/O 窗口内发出的新调度请求（BUG-006）。
         bg_compaction_scheduled_ = false;
+        BackgroundCompaction();
+        // 仅在仍有 imm_ backlog 时继续调度，避免 “NeedsCompaction=true 但无可选任务”
+        // 的场景下进入高频空转（BUG-006）。
+        if (imm_ != nullptr) {
+            MaybeScheduleCompaction();
+        }
 
         // 通知 MakeRoomForWrite 中被阻塞的前台线程继续写入。
         bg_cv_.notify_all();
@@ -301,17 +323,20 @@ void DBImpl::BackgroundCompaction() {
         }
     }
 
-    // 若未禁用自动 compaction 且 flush 后仍触发条件，执行 SSTable 级归并。
-    if (!options_.disable_auto_compaction && versions_->NeedsCompaction()) {
+    // 若未禁用自动 compaction，则在同一轮唤醒中尽可能清空 compaction backlog。
+    // 这样不依赖“再次调度才能继续”这一脆弱假设，也能减少前台阻塞时间。
+    while (!options_.disable_auto_compaction && versions_->NeedsCompaction()) {
         Compaction* c = versions_->PickCompaction();
-        if (c != nullptr) {
-            Status s = RunCompaction(c);
-            delete c;
-            if (!s.ok()) {
-                std::cerr << "[ERROR] Level compaction failed: " << s.ToString() << "\n";
-            }
-            DeleteObsoleteFiles();
+        if (c == nullptr) {
+            break;
         }
+        Status s = RunCompaction(c);
+        delete c;
+        if (!s.ok()) {
+            std::cerr << "[ERROR] Level compaction failed: " << s.ToString() << "\n";
+            break;
+        }
+        DeleteObsoleteFiles();
     }
 }
 

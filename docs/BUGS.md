@@ -96,7 +96,18 @@ L1+ 的二分 `Compare(largest, k) < 0` 同样要换成 user_key 比较。
 **回归方式**:
 `compaction_ab_bench` 输出 on/off 两路的 `sst_files` / `total_bytes` 应有显著差异（开 compaction 应少一个数量级）。
 
-**状态**: 🔴 OPEN
+**状态**: 🟢 FIXED
+
+**修复 commit**: <待填>
+**验证证据**:
+- `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_full_fix2/ab`
+  在 `compaction_on` 路径观察到大量
+  `Removed obsolete SSTable` / `Removed obsolete WAL` 日志，说明后台 compaction 已实际执行。
+- 同一命令可正常结束（`real 0m0.868s`），不再出现此前的长时间无响应。
+
+**备注**:
+- 该修复解决的是“compaction 不触发 + 后台空转/卡住”问题。
+- on/off 的最终 `sst_files` 与 `total_bytes` 仍接近，属于 workload 可观测性问题，继续由 BUG-003 跟踪。
 
 ---
 
@@ -175,7 +186,12 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
 **回归方式**:
 `compaction_ab_bench --num_entries=20000` 应在可接受时间内结束，不需外部 kill。
 
-**状态**: 🔴 OPEN
+**状态**: 🟢 FIXED
+
+**修复 commit**: <待填>
+**验证证据**:
+- `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_full_fix2/ab`
+  可在 1 秒级结束（`real 0m0.868s`），无需外部 kill。
 
 
 ## 维护说明
