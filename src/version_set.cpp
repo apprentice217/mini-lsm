@@ -353,12 +353,26 @@ Compaction* VersionSet::PickCompaction() {
 //   L0：逆序扫描（最新文件优先），因为 L0 文件间 key 范围可能重叠；
 //   L1-L6：二分定位后单文件查询（同层文件不重叠且已有序）。
 Status Version::Get(const ReadOptions& options, const Slice& k, std::string* value) {
+    // 范围判断必须用 user_comparator 比较 user_key，而不是 InternalKeyComparator
+    // 比较整段 InternalKey。后者会按 (user_key ASC, seq DESC) 排序，
+    // 当 lookup 的 snapshot_seq 大于文件 boundary 的 seq 时，
+    // 同 user_key 下 lookup 反而被判定为小于 smallest，导致正确包含 key 的
+    // SST 被跳过 → 表面上是已经写入的 key 读不到 (BUG-001)。
+    // icmp_ 在 VersionSet 里被声明为 const Comparator* 但运行期一定是 InternalKeyComparator
+    // （由 DBImpl 构造时传入），这里向下转换以拿到底层 user_comparator。
+    const InternalKeyComparator* ikcmp =
+        static_cast<const InternalKeyComparator*>(vset_->icmp_);
+    const Comparator* ucmp = ikcmp->user_comparator();
+    const Slice user_k = ExtractUserKey(k);
+
     // --- L0：逆序扫描 ---
     const auto& level_0_files = files_[0];
     for (auto it = level_0_files.rbegin(); it != level_0_files.rend(); ++it) {
         const std::shared_ptr<FileMetaData>& f = *it;
-        if (vset_->icmp_->Compare(k, Slice(f->smallest)) >= 0 &&
-            vset_->icmp_->Compare(k, Slice(f->largest))  <= 0) {
+        const Slice user_smallest = ExtractUserKey(Slice(f->smallest));
+        const Slice user_largest  = ExtractUserKey(Slice(f->largest));
+        if (ucmp->Compare(user_k, user_smallest) >= 0 &&
+            ucmp->Compare(user_k, user_largest)  <= 0) {
             Status s = vset_->table_cache_->Get(options, f->number, f->file_size, k, value);
             if (s.ok()) return s;
             if (!s.IsNotFound()) return s; // I/O 错误，立即上报
@@ -370,11 +384,12 @@ Status Version::Get(const ReadOptions& options, const Slice& k, std::string* val
         const auto& files = files_[level];
         if (files.empty()) continue;
 
-        // L1+ 层文件按 smallest key 有序，二分找到第一个 largest >= k 的文件。
+        // L1+ 层文件按 user_key 有序且不重叠，二分找到第一个 largest_user >= user_k 的文件。
         size_t lo = 0, hi = files.size();
         while (lo < hi) {
             size_t mid = (lo + hi) / 2;
-            if (vset_->icmp_->Compare(Slice(files[mid]->largest), k) < 0) {
+            const Slice mid_largest_user = ExtractUserKey(Slice(files[mid]->largest));
+            if (ucmp->Compare(mid_largest_user, user_k) < 0) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -383,8 +398,9 @@ Status Version::Get(const ReadOptions& options, const Slice& k, std::string* val
 
         if (lo < files.size()) {
             const std::shared_ptr<FileMetaData>& f = files[lo];
-            // 还需确认 k >= f->smallest，否则 k 落在两个文件的间隙中。
-            if (vset_->icmp_->Compare(k, Slice(f->smallest)) >= 0) {
+            const Slice user_smallest = ExtractUserKey(Slice(f->smallest));
+            // 还需确认 user_k >= f.smallest_user，否则 k 落在两个文件的间隙中。
+            if (ucmp->Compare(user_k, user_smallest) >= 0) {
                 Status s = vset_->table_cache_->Get(options, f->number, f->file_size, k, value);
                 if (s.ok()) return s;
                 if (!s.IsNotFound()) return s;

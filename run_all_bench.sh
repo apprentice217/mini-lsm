@@ -51,39 +51,42 @@ cmake --build "${BUILD_DIR}" -j4
 mkdir -p "${RUN_DIR}" "${MT_DIR}"
 echo "==> Results directory: ${RUN_DIR}"
 
-echo "==> [1/6] db_correctness"
-"${BUILD_DIR}/db_correctness"
+# 所有 bench 的 stdout/stderr 都 tee 到 ${RUN_DIR}/<name>.log，方便复盘 (BUG-005)
+# pipefail 已经在脚本顶部 set，pipe 任何一段失败都会让脚本退出。
+echo "==> [1/6] db_correctness  (log: db_correctness.log)"
+"${BUILD_DIR}/db_correctness" 2>&1 | tee "${RUN_DIR}/db_correctness.log"
 
-echo "==> [2/6] db_bench"
+echo "==> [2/6] db_bench  (log: db_bench.log)"
 "${BUILD_DIR}/db_bench" \
   --num_entries="${NUM_ENTRIES}" \
   --batch_size="${BATCH_SIZE}" \
   --value_size="${VALUE_SIZE}" \
   --db_name="${BASELINE_DB_DIR}" \
-  --output_csv="${CSV_PATH}"
+  --output_csv="${CSV_PATH}" 2>&1 | tee "${RUN_DIR}/db_bench.log"
 
-echo "==> [3/6] db_bench_mt (threads: ${MT_THREADS})"
+echo "==> [3/6] db_bench_mt  (threads: ${MT_THREADS})"
 IFS=',' read -r -a THREAD_LIST <<< "${MT_THREADS}"
 for t in "${THREAD_LIST[@]}"; do
-  echo "  -> threads=${t}"
+  echo "  -> threads=${t}  (log: db_bench_mt_t${t}.log)"
   "${BUILD_DIR}/db_bench_mt" \
     --threads="${t}" \
     --ops_per_thread="${MT_OPS_PER_THREAD}" \
     --value_size="${VALUE_SIZE}" \
-    --db_name="${MT_DIR}/bench_mt_t${t}"
+    --db_name="${MT_DIR}/bench_mt_t${t}" 2>&1 | tee "${RUN_DIR}/db_bench_mt_t${t}.log"
 done
 
-echo "==> [4/6] memtable_ds_bench"
+echo "==> [4/6] memtable_ds_bench  (log: memtable_ds_bench.log)"
 "${BUILD_DIR}/memtable_ds_bench" \
   --n="${DS_N}" \
   --lookup="${DS_LOOKUP}" \
-  --seed="${DS_SEED}"
+  --seed="${DS_SEED}" 2>&1 | tee "${RUN_DIR}/memtable_ds_bench.log"
 
-echo "==> [5/6] compaction_ab_bench"
+echo "==> [5/6] compaction_ab_bench  (log: compaction_ab_bench.log)"
 "${BUILD_DIR}/compaction_ab_bench" \
   --num_entries="${AB_NUM_ENTRIES}" \
   --value_size="${AB_VALUE_SIZE}" \
-  --base_dir="${AB_BASE_DIR}"
+  --base_dir="${AB_BASE_DIR}" 2>&1 | tee "${RUN_DIR}/compaction_ab_bench.log"
 
 echo "==> Done."
 echo "Results CSV: ${CSV_PATH}"
+echo "All logs:    ${RUN_DIR}/*.log"
