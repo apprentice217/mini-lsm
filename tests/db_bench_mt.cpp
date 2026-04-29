@@ -17,7 +17,7 @@ struct Config {
     int threads = 4;
     int ops_per_thread = 5000;
     int value_size = 100;
-    std::string db_name = "./bench_mt_db";
+    std::string db_name = "./test_results/db_bench_mt_default/db";
 };
 
 bool StartsWith(const std::string& text, const std::string& prefix) {

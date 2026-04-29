@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -59,8 +60,8 @@ struct BenchConfig {
     int batch_size = 1000;
     bool enable_bloom = true;
     bool sync_write = false;
-    std::string db_name = "./bench_test_db";
-    std::string output_csv = "./benchmark_results.csv";
+    std::string db_name = "./test_results/db_bench_default/db";
+    std::string output_csv = "./test_results/db_bench_default/benchmark_results.csv";
 };
 
 void PrintUsage(const char* program) {
@@ -70,8 +71,8 @@ void PrintUsage(const char* program) {
         << "  --key_size=N         Key size in bytes (default: 16)\n"
         << "  --value_size=N       Value size in bytes (default: 100)\n"
         << "  --batch_size=N       Batch size for writes (default: 1000)\n"
-        << "  --db_name=PATH       DB directory (default: ./bench_test_db)\n"
-        << "  --output_csv=PATH    CSV output file (default: ./benchmark_results.csv)\n"
+        << "  --db_name=PATH       DB directory (default: ./test_results/db_bench_default/db)\n"
+        << "  --output_csv=PATH    CSV output file (default: ./test_results/db_bench_default/benchmark_results.csv)\n"
         << "  --sync_write=0|1     WAL sync on every write (default: 0)\n"
         << "  --enable_bloom=0|1   Enable bloom filter (default: 1)\n";
 }
@@ -273,6 +274,9 @@ int main(int argc, char** argv) {
     std::cout << "=== Mini-LevelDB Benchmark ===" << std::endl;
     BenchConfig cfg;
     if (!ParseArgs(argc, argv, &cfg)) return 1;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(cfg.db_name).parent_path(), ec);
+    std::filesystem::create_directories(std::filesystem::path(cfg.output_csv).parent_path(), ec);
 
     PrintEnvironment();
     std::cout << "num_entries=" << cfg.num_entries

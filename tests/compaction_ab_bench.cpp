@@ -14,7 +14,7 @@ namespace {
 struct Config {
     int num_entries = 20000;
     int value_size = 100;
-    std::string base_dir = "./bench_compaction_ab";
+    std::string base_dir = "./test_results/compaction_ab_default/ab";
 };
 
 bool StartsWith(const std::string& text, const std::string& prefix) {

@@ -20,8 +20,8 @@ struct IntComparator {
 };
 
 struct Config {
-    int n = 200000;
-    int lookup = 100000;
+    int n = 50000;
+    int lookup = 50000;
     int seed = 42;
 };
 
@@ -71,6 +71,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    std::cout << "[memtable_ds_bench] start n=" << cfg.n
+              << " lookup=" << cfg.lookup
+              << " seed=" << cfg.seed << std::endl;
+
     std::vector<uint64_t> keys(static_cast<size_t>(cfg.n));
     for (int i = 0; i < cfg.n; ++i) keys[static_cast<size_t>(i)] = static_cast<uint64_t>(i + 1);
     std::mt19937_64 rng(static_cast<uint64_t>(cfg.seed));
@@ -86,16 +90,33 @@ int main(int argc, char** argv) {
     minidb::Arena arena;
     IntComparator cmp;
     minidb::SkipList<uint64_t, IntComparator> list(cmp, &arena);
-    double skip_insert = TimeMillis([&]() {
-        for (uint64_t k : keys) list.Insert(k);
-    });
-    size_t skip_hits = 0;
-    double skip_lookup = TimeMillis([&]() {
-        for (uint64_t k : lookups) {
-            if (list.Contains(k)) ++skip_hits;
+    std::cout << "[memtable_ds_bench] phase=skiplist_insert" << std::endl;
+    auto s0 = std::chrono::steady_clock::now();
+    const int insert_step = std::max(1, cfg.n / 10);
+    for (int i = 0; i < cfg.n; ++i) {
+        list.Insert(keys[static_cast<size_t>(i)]);
+        if ((i + 1) % insert_step == 0 || i + 1 == cfg.n) {
+            std::cout << "  progress " << (i + 1) << "/" << cfg.n << std::endl;
         }
-    });
+    }
+    auto s1 = std::chrono::steady_clock::now();
+    double skip_insert = std::chrono::duration<double, std::milli>(s1 - s0).count();
+
+    size_t skip_hits = 0;
+    std::cout << "[memtable_ds_bench] phase=skiplist_lookup" << std::endl;
+    auto sl0 = std::chrono::steady_clock::now();
+    const int lookup_step = std::max(1, cfg.lookup / 10);
+    for (int i = 0; i < cfg.lookup; ++i) {
+        if (list.Contains(lookups[static_cast<size_t>(i)])) ++skip_hits;
+        if ((i + 1) % lookup_step == 0 || i + 1 == cfg.lookup) {
+            std::cout << "  progress " << (i + 1) << "/" << cfg.lookup << std::endl;
+        }
+    }
+    auto sl1 = std::chrono::steady_clock::now();
+    double skip_lookup = std::chrono::duration<double, std::milli>(sl1 - sl0).count();
+
     uint64_t skip_iter_sum = 0;
+    std::cout << "[memtable_ds_bench] phase=skiplist_iter" << std::endl;
     double skip_iter = TimeMillis([&]() {
         minidb::SkipList<uint64_t, IntComparator>::Iterator it(&list);
         for (it.SeekToFirst(); it.Valid(); it.Next()) skip_iter_sum += it.key();
@@ -103,16 +124,19 @@ int main(int argc, char** argv) {
 
     // std::map (RB-Tree) benchmark
     std::map<uint64_t, uint64_t> tree;
+    std::cout << "[memtable_ds_bench] phase=rbtree_insert" << std::endl;
     double tree_insert = TimeMillis([&]() {
         for (uint64_t k : keys) tree.emplace(k, k);
     });
     size_t tree_hits = 0;
+    std::cout << "[memtable_ds_bench] phase=rbtree_lookup" << std::endl;
     double tree_lookup = TimeMillis([&]() {
         for (uint64_t k : lookups) {
             if (tree.find(k) != tree.end()) ++tree_hits;
         }
     });
     uint64_t tree_iter_sum = 0;
+    std::cout << "[memtable_ds_bench] phase=rbtree_iter" << std::endl;
     double tree_iter = TimeMillis([&]() {
         for (const auto& kv : tree) tree_iter_sum += kv.first;
     });

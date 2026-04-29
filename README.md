@@ -87,21 +87,21 @@ make -j4
 
 ```bash
 # 1) 参数化单线程基线（含环境信息与 CSV 落盘）
-./build/db_bench --num_entries=100000 --batch_size=1000 --output_csv=./benchmark_results.csv
+./build/db_bench --num_entries=100000 --batch_size=1000 --output_csv=./test_results/manual/db_bench.csv
 
 # 2) 正确性回归（WriteBatch 与覆盖写语义）
 ./build/db_correctness
 
 # 3) 多线程并发写压测（输出吞吐 + p50/p95/p99）
-./build/db_bench_mt --threads=1 --ops_per_thread=5000 --db_name=./bench_mt_t1
-./build/db_bench_mt --threads=4 --ops_per_thread=5000 --db_name=./bench_mt_t4
-./build/db_bench_mt --threads=8 --ops_per_thread=5000 --db_name=./bench_mt_t8
+./build/db_bench_mt --threads=1 --ops_per_thread=5000 --db_name=./test_results/manual/bench_mt_t1
+./build/db_bench_mt --threads=4 --ops_per_thread=5000 --db_name=./test_results/manual/bench_mt_t4
+./build/db_bench_mt --threads=8 --ops_per_thread=5000 --db_name=./test_results/manual/bench_mt_t8
 
 # 4) SkipList vs 红黑树（std::map）微基准
 ./build/memtable_ds_bench --n=200000 --lookup=100000 --seed=42
 
 # 5) Compaction A/B 对比实验
-./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=./bench_compaction_ab
+./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=./test_results/manual/compaction_ab
 ```
 
 也可以统一通过 CTest 执行：
@@ -109,6 +109,8 @@ make -j4
 ```bash
 ctest --test-dir build --output-on-failure
 ```
+
+执行 `./run_all_bench.sh` 时，测试产物会统一输出到 `test_results/run_YYYYMMDD_HHMMSS/`，便于和源码目录隔离。
 
 ### 新增实验开关
 
@@ -176,11 +178,6 @@ db->ReleaseSnapshot(snap);
 - Snapshot 隔离读（GetSnapshot / ReleaseSnapshot）
 - Bloom Filter、前缀压缩、CRC32c 校验
 - 后台 flush 线程、背压机制、LRU Table Cache
-- 参数化 benchmark（环境信息打印 + CSV 结果落盘）
-- 多线程并发写基准（吞吐 + p50/p95/p99）
-- SkipList vs 红黑树微基准
-- Compaction on/off A/B 对比基准
-- 基础正确性回归测试（`db_correctness`）
 - 参数化 benchmark（环境信息打印 + CSV 结果落盘）
 - 多线程并发写基准（吞吐 + p50/p95/p99）
 - SkipList vs 红黑树微基准
