@@ -689,6 +689,25 @@ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
     delete snapshot;
 }
 
+void DBImpl::GetLevelFileStats(std::vector<uint64_t>* files_per_level,
+                               std::vector<uint64_t>* bytes_per_level) {
+    if (files_per_level == nullptr || bytes_per_level == nullptr) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    files_per_level->assign(kNumLevels, 0);
+    bytes_per_level->assign(kNumLevels, 0);
+    std::shared_ptr<Version> cur = versions_->current();
+    if (cur == nullptr) return;
+    for (int level = 0; level < kNumLevels; ++level) {
+        const auto& files = cur->files(level);
+        (*files_per_level)[level] = static_cast<uint64_t>(files.size());
+        uint64_t bytes = 0;
+        for (const auto& f : files) {
+            bytes += f->file_size;
+        }
+        (*bytes_per_level)[level] = bytes;
+    }
+}
+
 // --------------------------------------------------------------------------
 // DB::Open
 // --------------------------------------------------------------------------

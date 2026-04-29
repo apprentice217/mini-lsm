@@ -4,7 +4,9 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <vector>
 #include "db.h"
+#include "db_impl.h"
 #include "options.h"
 
 using namespace minidb;
@@ -85,6 +87,8 @@ struct Result {
     double read_seconds = 0.0;
     uint64_t found = 0;
     DirStats stats;
+    std::vector<uint64_t> level_file_counts;
+    std::vector<uint64_t> level_total_bytes;
 };
 
 Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num_entries, int value_size) {
@@ -127,14 +131,32 @@ Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num
     }
     auto r1 = std::chrono::steady_clock::now();
 
+    Result result;
+    if (DBImpl* impl = dynamic_cast<DBImpl*>(db)) {
+        impl->GetLevelFileStats(&result.level_file_counts, &result.level_total_bytes);
+    }
     delete db;
     DirStats st = ScanDir(db_path);
-    Result result;
     result.write_seconds = std::chrono::duration<double>(w1 - w0).count();
     result.read_seconds = std::chrono::duration<double>(r1 - r0).count();
     result.found = found;
     result.stats = st;
     return result;
+}
+
+std::string FormatLevelStats(const std::vector<uint64_t>& counts, const std::vector<uint64_t>& bytes) {
+    if (counts.empty() || bytes.empty() || counts.size() != bytes.size()) return "n/a";
+    std::string out;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (!out.empty()) out.append("|");
+        out.append("L").append(std::to_string(i))
+            .append(":")
+            .append(std::to_string(counts[i]))
+            .append("f/")
+            .append(std::to_string(bytes[i]))
+            .append("b");
+    }
+    return out;
 }
 
 void PrintResult(const std::string& name, const Result& r, int num_entries) {
@@ -149,6 +171,7 @@ void PrintResult(const std::string& name, const Result& r, int num_entries) {
               << " sst_files=" << r.stats.sst_files
               << " log_files=" << r.stats.log_files
               << " total_bytes=" << r.stats.total_bytes
+              << " level_stats=" << FormatLevelStats(r.level_file_counts, r.level_total_bytes)
               << "\n";
 }
 

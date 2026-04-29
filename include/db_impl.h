@@ -12,6 +12,7 @@
 #include <string>
 #include <cstdint>
 #include <list>
+#include <vector>
 
 namespace minidb {
 
@@ -38,6 +39,10 @@ public:
     // GetSnapshot 创建当前时刻的只读快照，ReleaseSnapshot 释放。
     const Snapshot* GetSnapshot() override;
     void ReleaseSnapshot(const Snapshot* snapshot) override;
+
+    // 调试/实验接口：返回当前 Version 每层（L0..）的文件数和总字节数。
+    void GetLevelFileStats(std::vector<uint64_t>* files_per_level,
+                           std::vector<uint64_t>* bytes_per_level);
 
 private:
     // MakeRoomForWrite 在写入前确保 mem_ 有足够空间。

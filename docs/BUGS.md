@@ -126,7 +126,15 @@ compaction_off L0=49 files (2.4MB) L1=0  L2=0
 
 需要给 `DB` 抽象暴露一个 `GetLevelStats()` 接口，或者直接读 MANIFEST 反推。
 
-**状态**: 🟡 IN PROGRESS
+**状态**: 🟢 FIXED
+
+**修复 commit**: <待填>
+**验证证据**:
+- `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_levels/ab`
+  输出示例：
+  - `compaction_on  ... level_stats=L0:0f/0b|L1:49f/2351787b|...`
+  - `compaction_off ... level_stats=L0:49f/2351787b|L1:0f/0b|...`
+- 现在无需猜测目录中文件形态即可直接判断 compaction 是否生效。
 
 ---
 
