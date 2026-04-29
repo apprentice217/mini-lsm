@@ -128,7 +128,7 @@ compaction_off L0=49 files (2.4MB) L1=0  L2=0
 
 **状态**: 🟢 FIXED
 
-**修复 commit**: <待填>
+**修复 commit**: 27d87f5
 **验证证据**:
 - `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_levels/ab`
   输出示例：
