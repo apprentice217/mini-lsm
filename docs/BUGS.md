@@ -60,7 +60,7 @@ L1+ 的二分 `Compare(largest, k) < 0` 同样要换成 user_key 比较。
 
 **状态**: 🟢 FIXED
 
-**修复 commit**: <待填>
+**修复 commit**: fc6389b
 **验证证据**:
 - `./build/compaction_ab_bench --num_entries=500 --value_size=100 --base_dir=/tmp/cab_small/ab`
   输出：`found=500`。
@@ -98,7 +98,7 @@ L1+ 的二分 `Compare(largest, k) < 0` 同样要换成 user_key 比较。
 
 **状态**: 🟢 FIXED
 
-**修复 commit**: <待填>
+**修复 commit**: b0a5b43
 **验证证据**:
 - `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_full_fix2/ab`
   在 `compaction_on` 路径观察到大量
@@ -188,7 +188,7 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
 
 **状态**: 🟢 FIXED
 
-**修复 commit**: <待填>
+**修复 commit**: b0a5b43
 **验证证据**:
 - `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_full_fix2/ab`
   可在 1 秒级结束（`real 0m0.868s`），无需外部 kill。
