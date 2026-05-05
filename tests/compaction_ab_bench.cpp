@@ -93,38 +93,38 @@ struct Result {
     double read_seconds = 0.0;
     uint64_t found = 0;
     uint64_t total_writes = 0;
+    int drain_wait_ms = 0;
+    bool drain_timeout = false;
     DirStats stats;
     std::vector<uint64_t> level_file_counts;
     std::vector<uint64_t> level_total_bytes;
 };
 
-void WaitForCompactionDrain(DB* db, bool disable_auto_compaction) {
-    if (disable_auto_compaction) return;
+void WaitForCompactionDrain(DB* db, bool disable_auto_compaction, Result* result) {
+    if (disable_auto_compaction || result == nullptr) return;
     DBImpl* impl = dynamic_cast<DBImpl*>(db);
     if (impl == nullptr) return;
 
     // 避免“写入刚结束就采样”导致 compaction_on 尚未把 L0 backlog 处理完。
-    // 等待上限较短，时间会计入 write_s，反映端到端写开销。
-    const int kMaxWaitMs = 2500;
+    // 等待时间会计入 write_s，反映开启 compaction 的端到端成本。
+    // 之前 2.5s 上限在 churn 负载下不够，导致 level_stats 采样偏早。
+    const int kMaxWaitMs = 15000;
     int waited_ms = 0;
-    uint64_t prev_l0_files = UINT64_MAX;
-    int stable_rounds = 0;
     while (waited_ms < kMaxWaitMs) {
         std::vector<uint64_t> files;
         std::vector<uint64_t> bytes;
         impl->GetLevelFileStats(&files, &bytes);
         const uint64_t l0_files = files.empty() ? 0 : files[0];
-        if (l0_files == 0) return;
-        if (l0_files == prev_l0_files) {
-            ++stable_rounds;
-            if (stable_rounds >= 4) return;
-        } else {
-            stable_rounds = 0;
+        if (l0_files == 0) {
+            result->drain_wait_ms = waited_ms;
+            result->drain_timeout = false;
+            return;
         }
-        prev_l0_files = l0_files;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         waited_ms += 50;
     }
+    result->drain_wait_ms = waited_ms;
+    result->drain_timeout = true;
 }
 
 Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num_entries,
@@ -167,7 +167,8 @@ Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num
         }
         total_writes += static_cast<uint64_t>(num_entries);
     }
-    WaitForCompactionDrain(db, disable_auto_compaction);
+    Result result;
+    WaitForCompactionDrain(db, disable_auto_compaction, &result);
     auto w1 = std::chrono::steady_clock::now();
 
     std::mt19937 rng(2026);
@@ -183,7 +184,6 @@ Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num
     }
     auto r1 = std::chrono::steady_clock::now();
 
-    Result result;
     if (DBImpl* impl = dynamic_cast<DBImpl*>(db)) {
         impl->GetLevelFileStats(&result.level_file_counts, &result.level_total_bytes);
     }
@@ -219,6 +219,8 @@ void PrintResult(const std::string& name, const Result& r, int num_entries) {
               << " write_s=" << r.write_seconds
               << " write_ops=" << write_ops
               << " total_writes=" << r.total_writes
+              << " drain_wait_ms=" << r.drain_wait_ms
+              << " drain_timeout=" << (r.drain_timeout ? 1 : 0)
               << " read_s=" << r.read_seconds
               << " read_ops=" << read_ops
               << " found=" << r.found
