@@ -17,6 +17,7 @@ struct Config {
     int threads = 4;
     int ops_per_thread = 5000;
     int value_size = 100;
+    int write_buffer_size = 256 * 1024;
     std::string db_name = "./test_results/db_bench_mt_default/db";
 };
 
@@ -42,11 +43,13 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
         if (ParseIntArg(arg, "--threads=", &cfg->threads)) continue;
         if (ParseIntArg(arg, "--ops_per_thread=", &cfg->ops_per_thread)) continue;
         if (ParseIntArg(arg, "--value_size=", &cfg->value_size)) continue;
+        if (ParseIntArg(arg, "--write_buffer_size=", &cfg->write_buffer_size)) continue;
         if (ParseStringArg(arg, "--db_name=", &cfg->db_name)) continue;
         std::cerr << "Unknown arg: " << arg << "\n";
         return false;
     }
-    return cfg->threads > 0 && cfg->ops_per_thread > 0 && cfg->value_size > 0;
+    return cfg->threads > 0 && cfg->ops_per_thread > 0 &&
+           cfg->value_size > 0 && cfg->write_buffer_size > 0;
 }
 
 double PercentileMicros(const std::vector<double>& sorted_micros, double p) {
@@ -80,12 +83,14 @@ int main(int argc, char** argv) {
     Config cfg;
     if (!ParseArgs(argc, argv, &cfg)) {
         std::cerr << "Usage: " << argv[0]
-                  << " --threads=N --ops_per_thread=N --value_size=N --db_name=PATH\n";
+                  << " --threads=N --ops_per_thread=N --value_size=N"
+                  << " --write_buffer_size=N --db_name=PATH\n";
         return 1;
     }
 
     Options options;
     options.create_if_missing = true;
+    options.write_buffer_size = static_cast<size_t>(cfg.write_buffer_size);
 
     DB* db = nullptr;
     Status s = DB::Open(options, cfg.db_name, &db);
@@ -141,6 +146,7 @@ int main(int argc, char** argv) {
     std::cout << "threads=" << cfg.threads
               << ", ops_per_thread=" << cfg.ops_per_thread
               << ", value_size=" << cfg.value_size
+              << ", write_buffer_size=" << cfg.write_buffer_size
               << ", total_ops=" << total_ops << "\n";
     std::cout << "elapsed_s=" << elapsed_s
               << ", ops_per_sec=" << ops_per_sec << "\n";

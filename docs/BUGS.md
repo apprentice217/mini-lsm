@@ -155,7 +155,13 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
 
 推荐 B（更可控、跑得快）。
 
-**状态**: 🔴 OPEN
+**状态**: 🟢 FIXED
+
+**修复 commit**: <待填>
+**验证证据**:
+- `./build/db_bench_mt --threads=1 --ops_per_thread=5000 --value_size=100 --write_buffer_size=262144 --db_name=/tmp/mt_t1_fix/db`
+  运行后目录出现 `000005.sst`、`000008.sst`，说明低线程档位已覆盖 flush/磁盘路径，不再是纯 memtable 写。
+- `run_all_bench.sh` 已支持 `--mt_write_buffer_size=`，可统一控制所有线程档位走同一写路径。
 
 ---
 
@@ -200,6 +206,50 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
 **验证证据**:
 - `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=/tmp/cab_full_fix2/ab`
   可在 1 秒级结束（`real 0m0.868s`），无需外部 kill。
+
+---
+
+## BUG-007 🔴 P1 — SkipList 层高分布退化导致微基准性能异常
+
+**发现日期**: 2026-05-05  
+**发现来源**: `test_results/run_20260505_200329/memtable_ds_bench.log`，`n=50000` 下 SkipList 明显慢于红黑树两个数量级（insert/lookup 达秒级）。
+
+**根因**:
+`skiplist.h::RandomHeight()` 使用了 LCG 的低位 `%4` 判定。该 LCG 参数的低 2 位呈固定周期振荡，导致层高几乎退化为 1~2 层，SkipList 接近线性扫描，写/查复杂度显著恶化。
+
+**修复策略**:
+- 保持轻量 LCG，但改用高 16 位做 `p=1/4` 判定，恢复近似几何分布的层高。
+
+**回归方式**:
+- `./build/memtable_ds_bench --n=50000 --lookup=50000 --seed=42`
+  修复后结果：`skiplist insert_ms=43.3 lookup_ms=49.1`（从原先秒级降到毫秒级，恢复正常数量级）。
+
+**状态**: 🟢 FIXED
+**修复 commit**: <待填>
+
+
+---
+
+## BUG-008 🔴 P1 — Compaction A/B 在低冲突工作负载下区分度不足
+
+**发现日期**: 2026-05-05  
+**发现来源**: `run_20260505_200329/compaction_ab_bench.log` 中 on/off 的 `sst_files` 与 `total_bytes` 接近，难以支撑“compaction 收益”结论。
+
+**根因**:
+原始 A/B 仅做一次顺序写 + 随机读，key 覆盖率低，历史版本少；即使 compaction 生效也难形成明显的空间/读放大差异。
+
+**修复策略**:
+- `compaction_ab_bench` 新增 churn 工作负载参数：`--churn_rounds`、`--hot_key_space`，在热 key 空间重复覆盖写，放大历史版本堆积。
+- 在 compaction_on 路径增加短暂 drain 等待，避免“写完立即采样”把未完成的后台合并误判为 on/off 一样。
+
+**回归方式**:
+- `./build/compaction_ab_bench --num_entries=20000 --value_size=100 --churn_rounds=3 --hot_key_space=2000 --base_dir=/tmp/cab_churn2/ab`
+  - `compaction_on:  L0:0,   L1:2,   total_bytes≈2.4MB`
+  - `compaction_off: L0:196, L1:0,   total_bytes≈9.5MB`
+  读吞吐也出现明显差异（on 高于 off）。
+
+**状态**: 🟢 FIXED
+**修复 commit**: <待填>
 
 
 ## 维护说明

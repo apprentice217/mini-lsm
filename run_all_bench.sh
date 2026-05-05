@@ -16,12 +16,15 @@ NUM_ENTRIES="${NUM_ENTRIES:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-1000}"
 MT_OPS_PER_THREAD="${MT_OPS_PER_THREAD:-5000}"
 MT_THREADS="${MT_THREADS:-1,2,4,8,16}"
+MT_WRITE_BUFFER_SIZE="${MT_WRITE_BUFFER_SIZE:-262144}"
 VALUE_SIZE="${VALUE_SIZE:-100}"
 DS_N="${DS_N:-50000}"
 DS_LOOKUP="${DS_LOOKUP:-50000}"
 DS_SEED="${DS_SEED:-42}"
 AB_NUM_ENTRIES="${AB_NUM_ENTRIES:-20000}"
 AB_VALUE_SIZE="${AB_VALUE_SIZE:-100}"
+AB_CHURN_ROUNDS="${AB_CHURN_ROUNDS:-3}"
+AB_HOT_KEY_SPACE="${AB_HOT_KEY_SPACE:-2000}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,12 +33,15 @@ while [[ $# -gt 0 ]]; do
     --batch_size=*) BATCH_SIZE="${1#*=}" ;;
     --mt_ops_per_thread=*) MT_OPS_PER_THREAD="${1#*=}" ;;
     --mt_threads=*) MT_THREADS="${1#*=}" ;;
+    --mt_write_buffer_size=*) MT_WRITE_BUFFER_SIZE="${1#*=}" ;;
     --value_size=*) VALUE_SIZE="${1#*=}" ;;
     --ds_n=*) DS_N="${1#*=}" ;;
     --ds_lookup=*) DS_LOOKUP="${1#*=}" ;;
     --ds_seed=*) DS_SEED="${1#*=}" ;;
     --ab_num_entries=*) AB_NUM_ENTRIES="${1#*=}" ;;
     --ab_value_size=*) AB_VALUE_SIZE="${1#*=}" ;;
+    --ab_churn_rounds=*) AB_CHURN_ROUNDS="${1#*=}" ;;
+    --ab_hot_key_space=*) AB_HOT_KEY_SPACE="${1#*=}" ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -72,6 +78,7 @@ for t in "${THREAD_LIST[@]}"; do
     --threads="${t}" \
     --ops_per_thread="${MT_OPS_PER_THREAD}" \
     --value_size="${VALUE_SIZE}" \
+    --write_buffer_size="${MT_WRITE_BUFFER_SIZE}" \
     --db_name="${MT_DIR}/bench_mt_t${t}" 2>&1 | tee "${RUN_DIR}/db_bench_mt_t${t}.log"
 done
 
@@ -85,6 +92,8 @@ echo "==> [5/6] compaction_ab_bench  (log: compaction_ab_bench.log)"
 "${BUILD_DIR}/compaction_ab_bench" \
   --num_entries="${AB_NUM_ENTRIES}" \
   --value_size="${AB_VALUE_SIZE}" \
+  --churn_rounds="${AB_CHURN_ROUNDS}" \
+  --hot_key_space="${AB_HOT_KEY_SPACE}" \
   --base_dir="${AB_BASE_DIR}" 2>&1 | tee "${RUN_DIR}/compaction_ab_bench.log"
 
 echo "==> Done."

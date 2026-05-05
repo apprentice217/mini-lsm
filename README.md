@@ -93,15 +93,15 @@ make -j4
 ./build/db_correctness
 
 # 3) 多线程并发写压测（输出吞吐 + p50/p95/p99）
-./build/db_bench_mt --threads=1 --ops_per_thread=5000 --db_name=./test_results/manual/bench_mt_t1
-./build/db_bench_mt --threads=4 --ops_per_thread=5000 --db_name=./test_results/manual/bench_mt_t4
-./build/db_bench_mt --threads=8 --ops_per_thread=5000 --db_name=./test_results/manual/bench_mt_t8
+./build/db_bench_mt --threads=1 --ops_per_thread=5000 --write_buffer_size=262144 --db_name=./test_results/manual/bench_mt_t1
+./build/db_bench_mt --threads=4 --ops_per_thread=5000 --write_buffer_size=262144 --db_name=./test_results/manual/bench_mt_t4
+./build/db_bench_mt --threads=8 --ops_per_thread=5000 --write_buffer_size=262144 --db_name=./test_results/manual/bench_mt_t8
 
 # 4) SkipList vs 红黑树（std::map）微基准
 ./build/memtable_ds_bench --n=200000 --lookup=100000 --seed=42
 
 # 5) Compaction A/B 对比实验
-./build/compaction_ab_bench --num_entries=20000 --value_size=100 --base_dir=./test_results/manual/compaction_ab
+./build/compaction_ab_bench --num_entries=20000 --value_size=100 --churn_rounds=3 --hot_key_space=2000 --base_dir=./test_results/manual/compaction_ab
 ```
 
 也可以统一通过 CTest 执行：
@@ -111,6 +111,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 执行 `./run_all_bench.sh` 时，测试产物会统一输出到 `test_results/run_YYYYMMDD_HHMMSS/`，便于和源码目录隔离。
+可选参数示例：`--mt_write_buffer_size=262144 --ab_churn_rounds=3 --ab_hot_key_space=2000`。
 
 ### 新增实验开关
 

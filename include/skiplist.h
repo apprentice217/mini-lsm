@@ -114,8 +114,14 @@ SkipList<Key, Comparator>::NewNode(const Key& key, int height) {
 template <typename Key, class Comparator>
 int SkipList<Key, Comparator>::RandomHeight() {
     // 线性同余 PRNG，生成 p=1/4 的几何分布高度，避免引入标准库随机数开销。
+    // 不能直接使用最低位做取模判断：当前 LCG 参数会让低 2 位按固定周期振荡，
+    // 高度分布会严重退化（几乎只有 1~2 层），导致 SkipList 接近线性扫描。
+    // 这里改用高 16 位做判定，确保层高分布接近几何分布。
     int height = 1;
-    while (height < kMaxHeight && ((rnd_ = rnd_ * 1103515245 + 12345) % 4 == 0)) {
+    while (height < kMaxHeight) {
+        rnd_ = rnd_ * 1103515245 + 12345;
+        uint32_t r16 = rnd_ >> 16;
+        if ((r16 & 0x3u) != 0u) break;
         height++;
     }
     return height;
