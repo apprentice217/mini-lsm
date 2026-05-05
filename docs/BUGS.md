@@ -157,7 +157,7 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
 
 **状态**: 🟢 FIXED
 
-**修复 commit**: <待填>
+**修复 commit**: 9cd1e88
 **验证证据**:
 - `./build/db_bench_mt --threads=1 --ops_per_thread=5000 --value_size=100 --write_buffer_size=262144 --db_name=/tmp/mt_t1_fix/db`
   运行后目录出现 `000005.sst`、`000008.sst`，说明低线程档位已覆盖 flush/磁盘路径，不再是纯 memtable 写。
@@ -177,7 +177,7 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
 "${BUILD_DIR}/compaction_ab_bench" ... 2>&1 | tee "${RUN_DIR}/compaction_ab.log"
 ```
 
-**状态**: 🟢 FIXED — 见 commit `<待填>`，本次提交统一把 5 个 bench 的 stdout/stderr 都 tee 到 `${RUN_DIR}/<name>.log`。
+**状态**: 🟢 FIXED — 见 commit `fc6389b`，本次提交统一把 5 个 bench 的 stdout/stderr 都 tee 到 `${RUN_DIR}/<name>.log`。
 
 ---
 
@@ -225,7 +225,7 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
   修复后结果：`skiplist insert_ms=43.3 lookup_ms=49.1`（从原先秒级降到毫秒级，恢复正常数量级）。
 
 **状态**: 🟢 FIXED
-**修复 commit**: <待填>
+**修复 commit**: 9cd1e88
 
 
 ---
@@ -249,7 +249,7 @@ B. 给 `db_bench_mt` 加 `--write_buffer_size=N` 参数，配置成 64KB / 256KB
   读吞吐也出现明显差异（on 高于 off）。
 
 **状态**: 🟢 FIXED
-**修复 commit**: <待填>
+**修复 commit**: 9cd1e88
 
 
 ## 维护说明
