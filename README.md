@@ -86,22 +86,22 @@ make -j4
 当前仓库已提供 5 类可直接运行的测试/基准程序，用于回答“高并发阈值、数据结构选型、compaction 收益”这类项目深问。
 
 ```bash
-# 1) 参数化单线程基线（含环境信息与 CSV 落盘）
-./build/db_bench --num_entries=100000 --batch_size=1000 --output_csv=./test_results/manual/db_bench.csv
+# 1) 参数化单线程基线（含环境信息与 CSV 落盘）；batch 写入，每条 batch 结束按 WriteOptions 决定是否 fsync
+./build/db_bench --num_entries=500000 --batch_size=1000 --sync_write=1 --output_csv=./test_results/manual/db_bench.csv
 
 # 2) 正确性回归（WriteBatch 与覆盖写语义）
 ./build/db_correctness
 
-# 3) 多线程并发写压测（输出吞吐 + p50/p95/p99）
-./build/db_bench_mt --threads=1 --ops_per_thread=5000 --write_buffer_size=262144 --db_name=./test_results/manual/bench_mt_t1
-./build/db_bench_mt --threads=4 --ops_per_thread=5000 --write_buffer_size=262144 --db_name=./test_results/manual/bench_mt_t4
-./build/db_bench_mt --threads=8 --ops_per_thread=5000 --write_buffer_size=262144 --db_name=./test_results/manual/bench_mt_t8
+# 3) 多线程并发写压测（输出吞吐 + p50/p95/p99）；每线程每次 Put 都会走 WAL，`--sync_write=1` 即每次写入后 fsync
+./build/db_bench_mt --threads=1 --ops_per_thread=8000 --write_buffer_size=262144 --sync_write=1 --db_name=./test_results/manual/bench_mt_t1
+./build/db_bench_mt --threads=4 --ops_per_thread=8000 --write_buffer_size=262144 --sync_write=1 --db_name=./test_results/manual/bench_mt_t4
+./build/db_bench_mt --threads=8 --ops_per_thread=8000 --write_buffer_size=262144 --sync_write=1 --db_name=./test_results/manual/bench_mt_t8
 
 # 4) SkipList vs 红黑树（std::map）微基准
-./build/memtable_ds_bench --n=200000 --lookup=100000 --seed=42
+./build/memtable_ds_bench --n=200000 --lookup=200000 --seed=42
 
-# 5) Compaction A/B 对比实验
-./build/compaction_ab_bench --num_entries=20000 --value_size=100 --churn_rounds=3 --hot_key_space=2000 --base_dir=./test_results/manual/compaction_ab
+# 5) Compaction A/B 对比实验（每次 Put 可开启 WAL fsync）
+./build/compaction_ab_bench --num_entries=80000 --value_size=100 --churn_rounds=3 --hot_key_space=8000 --sync_write=1 --base_dir=./test_results/manual/compaction_ab
 ```
 
 也可以统一通过 CTest 执行：
@@ -110,8 +110,10 @@ make -j4
 ctest --test-dir build --output-on-failure
 ```
 
-执行 `./run_all_bench.sh` 时，测试产物会统一输出到 `test_results/run_YYYYMMDD_HHMMSS/`，便于和源码目录隔离。
-可选参数示例：`--mt_write_buffer_size=262144 --ab_churn_rounds=3 --ab_hot_key_space=2000`。
+执行 `./run_all_bench.sh` 时，测试产物会统一输出到 `test_results/run_YYYYMMDD_HHMMSS/`，便于和源码目录隔离。  
+**默认配置**（可用环境变量或同名参数覆盖）：`NUM_ENTRIES=500000`、`SYNC_WRITE=1`，多线程 `MT_OPS_PER_THREAD=8000`，compaction A/B 为 `AB_NUM_ENTRIES=80000`、`AB_HOT_KEY_SPACE=8000`，MemTable 微基准 `DS_N=200000`。  
+WAL 全 fsync 时整套件会明显变慢；快速冒烟可：`SYNC_WRITE=0 ./run_all_bench.sh` 或 `--sync_write=0`。  
+可选参数示例：`--num_entries=100000 --sync_write=0 --mt_write_buffer_size=262144 --mt_ops_per_thread=5000 --ab_churn_rounds=3 --ab_hot_key_space=2000`。
 
 ### 新增实验开关
 

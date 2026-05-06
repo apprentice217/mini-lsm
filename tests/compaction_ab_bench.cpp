@@ -19,6 +19,7 @@ struct Config {
     int value_size = 100;
     int churn_rounds = 3;
     int hot_key_space = 2000;
+    bool sync_write = false;
     std::string base_dir = "./test_results/compaction_ab_default/ab";
 };
 
@@ -38,6 +39,13 @@ bool ParseStringArg(const std::string& arg, const std::string& key, std::string*
     return true;
 }
 
+bool ParseBoolArg(const std::string& arg, const std::string& key, bool* out) {
+    if (!StartsWith(arg, key)) return false;
+    const std::string value = arg.substr(key.size());
+    *out = (value == "1" || value == "true" || value == "TRUE");
+    return true;
+}
+
 bool ParseArgs(int argc, char** argv, Config* cfg) {
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -45,6 +53,7 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
         if (ParseIntArg(arg, "--value_size=", &cfg->value_size)) continue;
         if (ParseIntArg(arg, "--churn_rounds=", &cfg->churn_rounds)) continue;
         if (ParseIntArg(arg, "--hot_key_space=", &cfg->hot_key_space)) continue;
+        if (ParseBoolArg(arg, "--sync_write=", &cfg->sync_write)) continue;
         if (ParseStringArg(arg, "--base_dir=", &cfg->base_dir)) continue;
         std::cerr << "Unknown arg: " << arg << "\n";
         return false;
@@ -108,7 +117,8 @@ void WaitForCompactionDrain(DB* db, bool disable_auto_compaction, Result* result
     // 避免“写入刚结束就采样”导致 compaction_on 尚未把 L0 backlog 处理完。
     // 等待时间会计入 write_s，反映开启 compaction 的端到端成本。
     // 之前 2.5s 上限在 churn 负载下不够，导致 level_stats 采样偏早。
-    const int kMaxWaitMs = 15000;
+    // 大负载 + WAL fsync 时 compaction 可能较慢，给足等待避免 level_stats 偏早采样。
+    const int kMaxWaitMs = 120000;
     int waited_ms = 0;
     while (waited_ms < kMaxWaitMs) {
         std::vector<uint64_t> files;
@@ -128,7 +138,7 @@ void WaitForCompactionDrain(DB* db, bool disable_auto_compaction, Result* result
 }
 
 Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num_entries,
-               int value_size, int churn_rounds, int hot_key_space) {
+               int value_size, int churn_rounds, int hot_key_space, bool sync_write) {
     std::error_code ec;
     std::filesystem::remove_all(db_path, ec);
 
@@ -146,6 +156,7 @@ Result RunCase(const std::string& db_path, bool disable_auto_compaction, int num
     }
 
     WriteOptions wo;
+    wo.sync = sync_write;
     auto w0 = std::chrono::steady_clock::now();
     for (int i = 0; i < num_entries; ++i) {
         std::string key = FixedKey(i);
@@ -238,20 +249,23 @@ int main(int argc, char** argv) {
     if (!ParseArgs(argc, argv, &cfg)) {
         std::cerr << "Usage: " << argv[0]
                   << " --num_entries=N --value_size=N --churn_rounds=N"
-                  << " --hot_key_space=N --base_dir=PATH\n";
+                  << " --hot_key_space=N [--sync_write=0|1] --base_dir=PATH\n";
         return 1;
     }
 
     const std::string on_path = cfg.base_dir + "_on";
     const std::string off_path = cfg.base_dir + "_off";
-    Result on = RunCase(on_path, false, cfg.num_entries, cfg.value_size, cfg.churn_rounds, cfg.hot_key_space);
-    Result off = RunCase(off_path, true, cfg.num_entries, cfg.value_size, cfg.churn_rounds, cfg.hot_key_space);
+    Result on =
+        RunCase(on_path, false, cfg.num_entries, cfg.value_size, cfg.churn_rounds, cfg.hot_key_space, cfg.sync_write);
+    Result off =
+        RunCase(off_path, true, cfg.num_entries, cfg.value_size, cfg.churn_rounds, cfg.hot_key_space, cfg.sync_write);
 
     std::cout << "=== Compaction A/B Benchmark ===\n";
     std::cout << "num_entries=" << cfg.num_entries
               << ", value_size=" << cfg.value_size
               << ", churn_rounds=" << cfg.churn_rounds
-              << ", hot_key_space=" << cfg.hot_key_space << "\n";
+              << ", hot_key_space=" << cfg.hot_key_space
+              << ", sync_write=" << (cfg.sync_write ? 1 : 0) << "\n";
     PrintResult("compaction_on", on, cfg.num_entries);
     PrintResult("compaction_off", off, cfg.num_entries);
     return 0;

@@ -18,6 +18,7 @@ struct Config {
     int ops_per_thread = 5000;
     int value_size = 100;
     int write_buffer_size = 256 * 1024;
+    bool sync_write = false;
     std::string db_name = "./test_results/db_bench_mt_default/db";
 };
 
@@ -37,6 +38,13 @@ bool ParseStringArg(const std::string& arg, const std::string& key, std::string*
     return true;
 }
 
+bool ParseBoolArg(const std::string& arg, const std::string& key, bool* out) {
+    if (!StartsWith(arg, key)) return false;
+    const std::string value = arg.substr(key.size());
+    *out = (value == "1" || value == "true" || value == "TRUE");
+    return true;
+}
+
 bool ParseArgs(int argc, char** argv, Config* cfg) {
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -44,6 +52,7 @@ bool ParseArgs(int argc, char** argv, Config* cfg) {
         if (ParseIntArg(arg, "--ops_per_thread=", &cfg->ops_per_thread)) continue;
         if (ParseIntArg(arg, "--value_size=", &cfg->value_size)) continue;
         if (ParseIntArg(arg, "--write_buffer_size=", &cfg->write_buffer_size)) continue;
+        if (ParseBoolArg(arg, "--sync_write=", &cfg->sync_write)) continue;
         if (ParseStringArg(arg, "--db_name=", &cfg->db_name)) continue;
         std::cerr << "Unknown arg: " << arg << "\n";
         return false;
@@ -84,7 +93,7 @@ int main(int argc, char** argv) {
     if (!ParseArgs(argc, argv, &cfg)) {
         std::cerr << "Usage: " << argv[0]
                   << " --threads=N --ops_per_thread=N --value_size=N"
-                  << " --write_buffer_size=N --db_name=PATH\n";
+                  << " --write_buffer_size=N [--sync_write=0|1] --db_name=PATH\n";
         return 1;
     }
 
@@ -110,6 +119,7 @@ int main(int argc, char** argv) {
     for (int tid = 0; tid < cfg.threads; ++tid) {
         workers.emplace_back([&, tid]() {
             WriteOptions wo;
+            wo.sync = cfg.sync_write;
             for (int i = 0; i < cfg.ops_per_thread; ++i) {
                 std::string key = FixedKey(tid, i);
                 std::string value = FixedValue(tid, i, cfg.value_size);
@@ -147,6 +157,7 @@ int main(int argc, char** argv) {
               << ", ops_per_thread=" << cfg.ops_per_thread
               << ", value_size=" << cfg.value_size
               << ", write_buffer_size=" << cfg.write_buffer_size
+              << ", sync_write=" << (cfg.sync_write ? 1 : 0)
               << ", total_ops=" << total_ops << "\n";
     std::cout << "elapsed_s=" << elapsed_s
               << ", ops_per_sec=" << ops_per_sec << "\n";
