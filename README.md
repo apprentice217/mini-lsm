@@ -85,6 +85,8 @@ make -j4
 
 当前仓库已提供 5 类可直接运行的测试/基准程序，用于回答“高并发阈值、数据结构选型、compaction 收益”这类项目深问。
 
+**说明**：`tests/` 下的基准与自动化脚本（如 `db_bench.cpp`、`db_bench_mt.cpp`、`compaction_ab_bench.cpp`、`run_all_bench.sh` 等）的**搭建与迭代过程使用 AI 编程辅助完成**；性能数据与结论由本人在目标环境中**实测**并复核。存储引擎核心实现仍以本人阅读 LevelDB 思路与手写调试为主。
+
 ```bash
 # 1) 参数化单线程基线（含环境信息与 CSV 落盘）；batch 写入，每条 batch 结束按 WriteOptions 决定是否 fsync
 ./build/db_bench --num_entries=500000 --batch_size=1000 --sync_write=1 --output_csv=./test_results/manual/db_bench.csv
@@ -147,15 +149,15 @@ db->ReleaseSnapshot(snap);
 
 ## Benchmark 结果
 
-测试配置：100,000 条记录，Key = 16 字节，Value = 100 字节，batch size = 1000，sync = false，Bloom Filter（10 bits/key）
+测试配置：500,000 条记录，Key = 16 字节，Value = 100 字节，batch size = 1000，sync = false，Bloom Filter（10 bits/key）
 
 | 测试项 | 耗时（micros/op） | 吞吐（ops/sec） | 数据量（MB/s） |
-|--------|-----------------|----------------|--------------|
-| FillSeq（顺序写） | 156 | 6,394 | 0.7 |
-| ReadRandom（随机读） | 18 | 56,022 | 6.2 |
-| FillRandom（随机写） | 112 | 8,893 | 1.0 |
+|--------|------------------|----------------|--------------|
+| FillSeq（顺序写） | 3.1 | 325,077 | 36.0 |
+| ReadRandom（随机读） | 3.5 | 283,425 | 31.4 |
+| FillRandom（随机写） | 20.9 | 47,792 | 5.3 |
 
-随机读命中率：99,998 / 100,000
+随机读命中率：500,000 / 500,000
 
 > 测试环境：Linux 6.8，单线程，Release 构建（-O2）
 
