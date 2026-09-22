@@ -6,25 +6,27 @@
 
 namespace minidb {
 
-// 内部强类型枚举，防止与全局 ValueType 冲突
+// 使用强类型枚举，枚举值会被限制在BatchValueType的作用域内，避免命名冲突,更加安全
 enum class BatchValueType : unsigned char {
     kTypeDeletion = 0x0,
     kTypeValue = 0x1
 };
 
+// 一条批操作会记录：操作类型、stirng类型的key、string类型的value
 struct BatchRecord {
     BatchValueType type;
     std::string key;
     std::string value;
 };
 
-// WriteBatch：将多个零散的 KV 操作打包为一个原子事务
+// WriteBatch：按添加顺序保存一组KV写入和删除操作，供数据库统一提交处理。
 class WriteBatch {
 public:
     WriteBatch() = default;
     ~WriteBatch() = default;
 
-    // 遵循 C++ Core Guidelines 的 Rule of Five：禁用拷贝，显式声明移动语义
+    // 禁止拷贝构造和拷贝赋值，允许移动构造和移动赋值
+    // 这里移动不代表移动后的源对象会自动变成空容器且源对象的byte_size_不会自动变0
     WriteBatch(const WriteBatch&) = delete;
     WriteBatch& operator=(const WriteBatch&) = delete;
     WriteBatch(WriteBatch&&) = default;
@@ -50,7 +52,7 @@ public:
 
 private:
     std::vector<BatchRecord> records_;
-    size_t byte_size_ = 0;
+    size_t byte_size_ = 0; // 记录批次的估计大小
 };
 
 } // namespace minidb

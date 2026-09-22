@@ -1,195 +1,67 @@
 # MiniLevelDB
 
-一个基于 LSM-tree（Log-Structured Merge-Tree）思想的嵌入式 KV 存储引擎，用 C++17 实现，对标 LevelDB 的核心读写链路。
+一个用 C++ 编写的本地键值存储引擎，参考 LevelDB 的 LSM-tree 设计。应用可以通过接口写入、查询和删除数据，数据保存在本地文件中。
 
-## 功能概述
+这个项目用于学习数据库底层实现，主要完成了从日志写入、内存存储到磁盘文件读写和后台合并的流程。开发中使用了 AI 编程辅助，目前仍在逐步检查和完善代码。
 
-- **持久化写入**：WAL（Write-Ahead Log）预写日志 + MemTable 内存缓冲，保证写入高吞吐的同时具备崩溃恢复能力
-- **有序磁盘存储**：Immutable MemTable 由后台线程异步 flush 为 Level-0 SSTable（`.sst`）文件
-- **多层 Compaction**：L0 文件数超阈值或 L1-L6 总字节超限时，后台线程自动触发多路归并压缩（L0→L1→…→L6）
-- **点查支持**：读路径按 MemTable → Immutable MemTable → Level-0 → Level-1-6 顺序查找；L1+ 使用二分定位
-- **范围迭代**：`NewIterator` 返回覆盖 MemTable + 所有 Level SSTable 的 MergingIterator，支持全量有序遍历
-- **Snapshot 隔离读**：`GetSnapshot`/`ReleaseSnapshot` 管理只读快照，持有快照的读操作不受后续写入影响
-- **Bloom Filter**：可选的布隆过滤器（每 2KB 数据一个 segment），在读磁盘前快速排除不存在的 key
-- **版本管理**：MANIFEST + CURRENT 记录文件集合的增量变更，支持启动时版本恢复
-- **LRU Table Cache**：缓存已打开的 SSTable 对象（Index Block + Bloom Filter 常驻内存），减少重复 I/O
+## 主要做了什么
 
-## 架构说明
+- **读写接口**：提供 `Put`、`Get`、`Delete`，通过 `WriteBatch` 一次提交多条修改。
+- **日志与恢复**：修改先写入 WAL 日志，再加入内存表；启动时读取文件元数据并回放日志。
+- **内存与磁盘存储**：用跳表保存内存中的记录，内存表达到阈值后，由后台线程写成有序的 SSTable 文件。
+- **后台合并**：将 SSTable 分为 L0～L6，合并重叠文件、整理旧版本，并更新 MANIFEST 中的文件记录。
+- **查询辅助**：用文件索引定位数据，配合 Bloom Filter 和已打开文件的缓存，减少不必要的读取。
+- **测试与实验**：提供基础正确性测试、单线程和多线程基准，以及跳表与 `std::map`、开启与关闭 Compaction 的对比程序。
 
-```
-写入路径：
-  WriteBatch
-    → WAL (log::Writer, 32KB block 分帧, CRC32c 校验)
-    → MemTable (SkipList + Arena)
-    → [内存满] Immutable MemTable
-    → [后台线程] SSTable (TableBuilder → .sst 写入 Level-0)
-    → VersionEdit → MANIFEST
-
-Compaction 路径（后台线程）：
-  PickCompaction (L0 文件数 >= 4 或 L1-L6 字节超限)
-    → 收集 inputs[0]（source level）和 inputs[1]（target level 重叠文件）
-    → MergingIterator 多路归并（去重旧版本，丢弃过时删除墓碑）
-    → 写出新 SSTable（单文件 ≤ 2MB，超出自动切分）
-    → VersionEdit（DeleteFile 旧文件 + AddFile 新文件）→ MANIFEST
-    → DeleteObsoleteFiles 删除不再引用的 .sst / .log
-
-读取路径：
-  Get(key, snapshot)
-    → MemTable::Get
-    → Immutable MemTable::Get（若存在）
-    → Version::Get
-         ├── L0：逆序扫描（文件间可重叠，最新文件优先）
-         └── L1-L6：二分定位（文件间不重叠，按 smallest key 有序）
-               └── TableCache::Get → Table::Get
-                    └── Index Block 二分 → Bloom Filter 过滤 → Data Block 精确匹配
-
-范围迭代路径：
-  NewIterator(ReadOptions)
-    → MergingIterator(MemTable iter + Imm iter + 所有 Level SSTable iters)
-    → SeekToFirst / Seek / Next → 全局有序视图（InternalKey 排序，上层可解析 UserKey）
-
-崩溃恢复：
-  DB::Open → VersionSet::Recover (CURRENT → MANIFEST)
-           → WAL 回放 (重建 MemTable，序列号前进)
-           → 分配新 WAL，写入 MANIFEST
-```
-
-## 核心模块
-
-| 模块 | 文件 | 说明 |
-|------|------|------|
-| 数据库引擎 | `src/db_impl.cpp` | 写入、读取、Snapshot、NewIterator、后台 Compaction、崩溃恢复 |
-| 多路归并迭代器 | `src/merging_iterator.cpp` | k 路归并，O(n) 每步，支持正向/反向遍历及方向切换 |
-| 内存表 | `src/memtable.cpp`, `include/skiplist.h` | SkipList + Arena，单写多读无锁 |
-| WAL | `src/log_writer.cpp`, `src/log_reader.cpp` | 分帧日志，CRC32c 校验，支持回放 |
-| SSTable 构建 | `src/table_builder.cpp`, `src/block_builder.cpp` | 前缀压缩 + 重启点 + CRC + Footer |
-| SSTable 读取 | `src/table.cpp`, `src/block.cpp` | 两层迭代器，Index Block 二分 |
-| 布隆过滤器 | `src/bloom.cpp`, `src/filter_block.cpp` | 多哈希 Bloom Filter，按 2KB 分 segment |
-| 版本管理 | `src/version_set.cpp`, `src/version_edit.cpp` | Copy-on-Write Version，MANIFEST 持久化，PickCompaction 轮转选文件 |
-| Table 缓存 | `src/table_cache.cpp` | LRU 缓存，容量 1000 个 SSTable |
-| 底层 I/O | `src/env_posix.cpp` | POSIX 文件接口，pread 线程安全随机读 |
-| InternalKey | `src/db_format.cpp` | UserKey 升序 + 序列号降序比较器，MVCC 基础 |
+写入时先记日志，再放进内存；查询时先找内存，再找磁盘文件。后台负责把内存数据写成文件，并持续合并整理已有文件。
 
 ## 编译与运行
 
-**依赖**：CMake >= 3.10，GCC/Clang（C++17）
+环境：Linux、支持 C++17 的 GCC 或 Clang、CMake 3.10 及以上。
+
+在仓库根目录执行：
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j4
-./db_bench
-```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
 
-## 测试与实验
-
-当前仓库已提供 5 类可直接运行的测试/基准程序，用于回答“高并发阈值、数据结构选型、compaction 收益”这类项目深问。
-
-**说明**：`tests/` 下的基准与自动化脚本（如 `db_bench.cpp`、`db_bench_mt.cpp`、`compaction_ab_bench.cpp`、`run_all_bench.sh` 等）的**搭建与迭代过程使用 AI 编程辅助完成**；性能数据与结论由本人在目标环境中**实测**并复核。存储引擎核心实现仍以本人阅读 LevelDB 思路与手写调试为主。
-
-```bash
-# 1) 参数化单线程基线（含环境信息与 CSV 落盘）；batch 写入，每条 batch 结束按 WriteOptions 决定是否 fsync
-./build/db_bench --num_entries=500000 --batch_size=1000 --sync_write=1 --output_csv=./test_results/manual/db_bench.csv
-
-# 2) 正确性回归（WriteBatch 与覆盖写语义）
+# 基础正确性测试
 ./build/db_correctness
 
-# 3) 多线程并发写压测（输出吞吐 + p50/p95/p99）；每线程每次 Put 都会走 WAL，`--sync_write=1` 即每次写入后 fsync
-./build/db_bench_mt --threads=1 --ops_per_thread=8000 --write_buffer_size=262144 --sync_write=1 --db_name=./test_results/manual/bench_mt_t1
-./build/db_bench_mt --threads=4 --ops_per_thread=8000 --write_buffer_size=262144 --sync_write=1 --db_name=./test_results/manual/bench_mt_t4
-./build/db_bench_mt --threads=8 --ops_per_thread=8000 --write_buffer_size=262144 --sync_write=1 --db_name=./test_results/manual/bench_mt_t8
-
-# 4) SkipList vs 红黑树（std::map）微基准
-./build/memtable_ds_bench --n=200000 --lookup=200000 --seed=42
-
-# 5) Compaction A/B 对比实验（每次 Put 可开启 WAL fsync）
-./build/compaction_ab_bench --num_entries=80000 --value_size=100 --churn_rounds=3 --hot_key_space=8000 --sync_write=1 --base_dir=./test_results/manual/compaction_ab
+# 单线程读写基准
+./build/db_bench --num_entries=100000 --batch_size=1000 --sync_write=1
 ```
 
-也可以统一通过 CTest 执行：
+`--sync_write=1` 表示每次提交写入后等待 WAL 同步；设为 `0` 可以减少等待，但不保证本次返回时日志已经持久化。
 
-```bash
-ctest --test-dir build --output-on-failure
-```
+其他测试程序：
 
-执行 `./run_all_bench.sh` 时，测试产物会统一输出到 `test_results/run_YYYYMMDD_HHMMSS/`，便于和源码目录隔离。  
-**默认配置**（可用环境变量或同名参数覆盖）：`NUM_ENTRIES=500000`、`SYNC_WRITE=1`，多线程 `MT_OPS_PER_THREAD=8000`，compaction A/B 为 `AB_NUM_ENTRIES=80000`、`AB_HOT_KEY_SPACE=8000`，MemTable 微基准 `DS_N=200000`。  
-WAL 全 fsync 时整套件会明显变慢；快速冒烟可：`SYNC_WRITE=0 ./run_all_bench.sh` 或 `--sync_write=0`。  
-可选参数示例：`--num_entries=100000 --sync_write=0 --mt_write_buffer_size=262144 --mt_ops_per_thread=5000 --ab_churn_rounds=3 --ab_hot_key_space=2000`。
+| 程序 | 用途 |
+|---|---|
+| `db_bench_mt` | 测量多线程写入吞吐和延迟 |
+| `memtable_ds_bench` | 比较跳表与 `std::map` 的插入、查询开销 |
+| `compaction_ab_bench` | 比较开启和关闭后台文件合并时的表现 |
 
-### 新增实验开关
+运行 `./run_all_bench.sh` 可统一编译并执行测试与基准，结果保存在 `test_results/`。性能结果需要结合数据量、批次大小、同步设置和运行环境一起看。
 
-`Options` 增加了实验用字段：
+## 代码从哪里看
 
-- `disable_auto_compaction`：关闭自动 level compaction（不影响 memtable flush），用于 compaction on/off A/B 对比。
+| 文件 | 主要内容 |
+|---|---|
+| `include/db.h`、`src/db_impl.cpp` | 对外接口，以及读写、恢复和后台任务的组织 |
+| `include/write_batch.h` | 保存一批待执行的写入和删除操作 |
+| `src/memtable.cpp`、`include/skiplist.h` | 内存表与跳表 |
+| `src/log_writer.cpp`、`src/log_reader.cpp` | WAL 的写入和读取 |
+| `src/table_builder.cpp`、`src/table.cpp` | SSTable 的构建和查询 |
+| `src/version_set.cpp`、`src/version_edit.cpp` | 管理各层文件及其变更，选择待合并的文件 |
 
-该开关仅建议用于实验，不建议作为默认线上配置。
+## 当前限制
 
-## 公共接口
+这是学习项目，仍有需要修正和验证的部分：
 
-```cpp
-// 打开或创建数据库
-Status DB::Open(const Options& options, const std::string& name, DB** dbptr);
+- 快照接口已存在，但内存查询还没有按快照序列号筛选记录。
+- 对外迭代器目前合并的是内部记录，尚未完成旧版本去重、删除标记过滤和快照过滤。
+- 查询在内存表中遇到删除标记时，目前会返回成功状态，需要修正为“未找到”。
+- `WriteBatch` 提供批量提交；异常情况下的批次原子性和崩溃恢复仍需进一步验证。
 
-// 点写/点读
-Status db->Put(WriteOptions, key, value);
-Status db->Get(ReadOptions, key, &value);
-Status db->Delete(WriteOptions, key);
-Status db->Write(WriteOptions, WriteBatch*);  // 原子批量写
-
-// 范围迭代（调用方负责 delete）
-Iterator* db->NewIterator(ReadOptions);
-
-// Snapshot 隔离读
-const Snapshot* snap = db->GetSnapshot();
-ReadOptions ro; ro.snapshot = snap;
-db->Get(ro, key, &value);           // 只看到 snap 创建时刻的数据
-db->ReleaseSnapshot(snap);
-```
-
-## Benchmark 结果
-
-测试配置：500,000 条记录，Key = 16 字节，Value = 100 字节，batch size = 1000，sync = false，Bloom Filter（10 bits/key）
-
-| 测试项 | 耗时（micros/op） | 吞吐（ops/sec） | 数据量（MB/s） |
-|--------|------------------|----------------|--------------|
-| FillSeq（顺序写） | 3.1 | 325,077 | 36.0 |
-| ReadRandom（随机读） | 3.5 | 283,425 | 31.4 |
-| FillRandom（随机写） | 20.9 | 47,792 | 5.3 |
-
-随机读命中率：500,000 / 500,000
-
-> 测试环境：Linux 6.8，单线程，Release 构建（-O2）
-
-### 性能优化说明
-
-相较于初始版本（Debug 构建，无 Bloom Filter），Release 版本包含以下四项优化：
-
-| 优化项 | 说明 |
-|--------|------|
-| WritableFile 64KB 写缓冲 | 将 `write(2)` 系统调用从 O(每条 record) 降低到 O(每 64KB)，批量落盘 |
-| MemTable 零分配编码 | `EncodeVarint32` 直接写入 Arena buffer，消除两次临时 `std::string` 堆分配 |
-| SSTable mmap 零拷贝读 | `mmap(PROT_READ) + MADV_RANDOM`，Data Block 读取无需从 Page Cache 拷贝到用户态 scratch |
-| Data Block 4KB→16KB + Bloom Filter | 更大的 Block 减少 Index 条目和 pread 次数；Bloom Filter（误报率 ~1%）跳过 99% 的无关 Data Block |
-
-## 当前实现范围
-
-**已实现**：
-- 完整的写入链路（WAL + MemTable + SSTable + MANIFEST）
-- 崩溃恢复（版本恢复 + WAL 回放）
-- 多层查询路径（L0 逆序扫描 + L1-L6 二分定位）
-- L0→L1→…→L6 多路归并 Compaction（轮转选文件，过时版本清理）
-- 范围迭代（MergingIterator，覆盖 MemTable + 所有 Level SSTable）
-- Snapshot 隔离读（GetSnapshot / ReleaseSnapshot）
-- Bloom Filter、前缀压缩、CRC32c 校验
-- 后台 flush 线程、背压机制、LRU Table Cache
-- 参数化 benchmark（环境信息打印 + CSV 结果落盘）
-- 多线程并发写基准（吞吐 + p50/p95/p99）
-- SkipList vs 红黑树微基准
-- Compaction on/off A/B 对比基准
-- 基础正确性回归测试（`db_correctness`）
-
-**计划中（TODO）**：
-- 压缩（Snappy/zstd）Block 数据
-- 统计信息（每层文件数、字节数、Compaction 次数）
-- 更精细的 Compaction 触发策略（如 seek-based compaction）
+现有正确性测试主要覆盖批量写入、覆盖写和正常关闭后重新打开，不能代替故障恢复测试。历史排查和修复记录见 [docs/BUGS.md](docs/BUGS.md)。

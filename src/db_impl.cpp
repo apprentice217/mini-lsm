@@ -185,9 +185,9 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 // Write 是所有写操作的统一入口。
 // 整批 WriteBatch 序列化为单条 WAL record 后原子写入，减少系统调用次数。
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_); // 创建一个锁管理对象，并立刻尝试锁住当前数据库实例的mutex_
 
-    Status s = MakeRoomForWrite(lock);
+    Status s = MakeRoomForWrite(lock); // 检查当前内存表是否可以继续接收写入，它检查的是当前占用，没有根据即将写入的整个批次预留空间
     if (!s.ok()) return s;
 
     uint64_t seq = last_sequence_ + 1;
@@ -219,7 +219,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         }
     }
 
-    // WAL 落盘成功后才写 MemTable，保证崩溃时可从日志恢复。
+    // 前面的准备和日志处理步骤未报告错误时，按顺序将批次操作加入 MemTable，
+    // 为每条操作分配递增序列号，并在完成后更新 last_sequence_。
+    // 注意：未启用 WAL 同步时，此处成功不代表日志已持久化。
     if (s.ok()) {
         for (const auto& record : updates->Records()) {
             uint32_t type = (record.type == BatchValueType::kTypeValue) ? kTypeValue : kTypeDeletion;

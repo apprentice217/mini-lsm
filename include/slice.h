@@ -7,6 +7,7 @@
 
 namespace minidb {
 
+// 记录一段字节数据:从哪里开始，长度是多少(指针和长度)
 class Slice {
 public:
     // 默认构造一个空的Slice
