@@ -16,7 +16,10 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
     // 若指定了初始偏移，将其向下对齐到 Block 边界，避免从 Block 中间开始解析。
     if (initial_offset > 0) {
         uint64_t block_start = (initial_offset / kBlockSize) * kBlockSize;
-        (void)file_->Skip(block_start);
+        Status s=file_->Skip(block_start);
+        if(!s.ok()) {
+            ReportDrop(0,s);
+        }
     }
 }
 
@@ -29,7 +32,13 @@ void Reader::ReportCorruption(uint64_t bytes, const char* reason) {
 }
 
 void Reader::ReportDrop(uint64_t bytes, const Status& reason) {
-    if (reporter_ != nullptr && bytes > 0) {
+    if (reason.ok()) return;
+
+    if (status_.ok()) {
+        status_ = reason;
+    }
+
+    if (reporter_ != nullptr) {
         reporter_->Corruption(static_cast<size_t>(bytes), reason);
     }
 }
@@ -43,11 +52,22 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
 
     Slice fragment;
     while (true) {
+
+        if(!status_.ok()) {
+            return false;
+        }
+
         unsigned int record_type = ReadPhysicalRecord(&fragment);
+
+        if(!status_.ok()) {
+            return false;
+        }
+
         switch (record_type) {
             case kFullType:
                 if (in_fragmented_record) {
                     ReportCorruption(scratch->size(), "partial record without end(1)");
+                    return false;
                 }
                 scratch->clear();
                 *record = fragment; // 零拷贝：直接暴露 backing_store_ 内的视图
@@ -80,11 +100,9 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
                 break;
 
             case kEof:
-                if (in_fragmented_record) {
-                    // 文件在 First/Middle 后意外截断（如写 WAL 时进程崩溃）。
-                    ReportCorruption(scratch->size(), "partial record without end(3)");
-                    scratch->clear();
-                }
+                // 正常 EOF 处未完成的分片记录不参与恢复。
+                // 真正的 I/O 错误已在前面的 status_ 检查中返回。
+                scratch->clear();
                 return false;
 
             case kBadRecord:

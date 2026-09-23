@@ -12,32 +12,63 @@
 #include <cstdio>
 #include <set>
 #include <algorithm>
+#include <cassert>
+#include <limits>
 
 namespace minidb {
 
-// CURRENT 文件记录当前生效的 MANIFEST 文件名（如 "MANIFEST-000001"）。
-// 使用 write-then-rename 原子更新，防止断电时 CURRENT 损坏。
-static Status SetCurrentFile(const std::string& dbname, uint64_t descriptor_number) {
-    char buf[100];
-    std::snprintf(buf, sizeof(buf), "MANIFEST-%06llu",
-                  (unsigned long long)descriptor_number);
-    std::string manifest_filename = buf;
+namespace {
 
-    std::string tmp     = dbname + "/CURRENT.tmp";
-    std::string current = dbname + "/CURRENT";
-
-    std::ofstream out(tmp, std::ios::out | std::ios::trunc);
-    if (!out.is_open()) {
-        return Status::IOError("Cannot create CURRENT.tmp");
+// 即使 Reader 没有 status() 接口，也能通过 Reporter 获取读取错误。
+class ManifestReporter final : public log::Reader::Reporter {
+public:
+    void Corruption(size_t, const Status& s) override {
+        if (status.ok()) status = s;
     }
-    out << manifest_filename << "\n";
-    out.close();
+    Status status;
+};
 
-    if(!out) {
-        return Status::IOError("Cannot write CURRENT.tmp");
+Status ValidateFileMetadata(int level, const FileMetaData& file,
+                            const Comparator* comparator) {
+    if (level < 0 || level >= kNumLevels) {
+        return Status::Corruption("Invalid file level");
     }
+    if (file.number == 0 || file.file_size == 0) {
+        return Status::Corruption("Invalid SST file metadata");
+    }
+    if (file.smallest.size() < 8 || file.largest.size() < 8) {
+        return Status::Corruption("Invalid internal key in file metadata");
+    }
+    if (comparator->Compare(Slice(file.smallest), Slice(file.largest)) > 0) {
+        return Status::Corruption("Reversed SST key range");
+    }
+    return Status::OK();
+}
 
-    // rename 是 POSIX 保证的原子操作，写完临时文件再 rename 可避免 CURRENT 写到一半崩溃。
+} // namespace
+
+// 先写入并同步临时文件，再通过 rename 替换 CURRENT。
+// 这里尚未同步目录，不能据此宣称整条路径已经具备断电持久性。
+static Status SetCurrentFile(const std::string& dbname,
+                             uint64_t descriptor_number) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "MANIFEST-%06llu",
+                  static_cast<unsigned long long>(descriptor_number));
+    const std::string contents = std::string(name) + "\n";
+    const std::string tmp = dbname + "/CURRENT.tmp";
+    const std::string current = dbname + "/CURRENT";
+
+    WritableFile* raw_file = nullptr;
+    Status s = NewWritableFile(tmp, &raw_file);
+    if (!s.ok()) return s;
+    std::unique_ptr<WritableFile> file(raw_file);
+
+    s = file->Append(Slice(contents));
+    if (s.ok()) s = file->Sync();
+    const Status close_status = file->Close();
+    if (s.ok()) s = close_status;
+    if (!s.ok()) return s;
+
     if (std::rename(tmp.c_str(), current.c_str()) != 0) {
         return Status::IOError("Cannot rename CURRENT.tmp to CURRENT");
     }
@@ -74,6 +105,26 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
     // 这里只把当前已生效的 log_number_ 补进这个待提交的 edit，
     // 使其写入 MANIFEST 后仍沿用原值。
     // 注意：这里只修改 edit，不修改 VersionSet 当前已生效的状态。
+    if (edit == nullptr) {
+        return Status::InvalidArgument("Null VersionEdit");
+    }
+    if (edit->has_log_number_ && edit->log_number_ < log_number_) {
+        return Status::InvalidArgument("WAL recovery number cannot decrease");
+    }
+    constexpr uint64_t kMaxSequence = (uint64_t{1} << 56) - 1;
+    if (last_sequence_ > kMaxSequence) {
+        return Status::Corruption("Sequence number exceeds 56 bits");
+    }
+    for (const auto& del : edit->deleted_files_) {
+        if (del.first < 0 || del.first >= kNumLevels) {
+            return Status::Corruption("Invalid deleted-file level");
+        }
+    }
+    for (const auto& added : edit->new_files_) {
+        Status check = ValidateFileMetadata(added.first, added.second, icmp_);
+        if (!check.ok()) return check;
+    }
+
     if(!edit->has_log_number_) {
         edit->SetLogNumber(log_number_);
     }
@@ -83,6 +134,9 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
 
     if(create_manifest) {
         for(;;) {
+            if (next_file_number_ == std::numeric_limits<uint64_t>::max()) {
+                return Status::IOError("File number exhausted");
+            }
             new_manifest_file_number = NextFileNumber();
 
             char name[64];
@@ -125,7 +179,13 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
     }
     for (const auto& new_file_pair : edit->new_files_) {
         int level = new_file_pair.first;
-        v->files_[level].push_back(std::make_shared<FileMetaData>(new_file_pair.second));
+        auto& files = v->files_[level];
+        const uint64_t number = new_file_pair.second.number;
+        files.erase(std::remove_if(files.begin(), files.end(),
+                                  [number](const std::shared_ptr<FileMetaData>& f) {
+                                      return f->number == number;
+                                  }), files.end());
+        files.push_back(std::make_shared<FileMetaData>(new_file_pair.second));
     }
 
     // L1+ 层文件之间不允许 key 范围重叠，且 Version::Get 的二分查找依赖 smallest key 有序。
@@ -143,7 +203,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
 
     if(create_manifest) {
         VersionEdit snapshot;
-        snapshot.SetLogNumber(log_number_);
+        snapshot.SetLogNumber(edit->log_number_);
         snapshot.SetNextFile(next_file_number_);
         snapshot.SetLastSequence(last_sequence_);
 
@@ -174,14 +234,14 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
             s=new_file->Sync();
         }
         if(s.ok()) {
-            s=SetCurrentFile(dbname_, new_manifest_number);
+            s=SetCurrentFile(dbname_, new_manifest_file_number);
         }
         if(!s.ok()) return s;
 
         // 新 MANIFEST 发布成功后，才接管这些对象。
         descriptor_file_ = new_file.release();
         descriptor_log_ = new_log.release();
-        manifest_file_number_ = new_manifest_number;
+        manifest_file_number_ = new_manifest_file_number;
     } else {
          // 已有完整基础状态，后续只追加本次增量。
         std::string record;
@@ -207,118 +267,141 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
 
 // Recover 从 CURRENT -> MANIFEST 链重建版本集合，恢复上次关闭时的文件视图。
 Status VersionSet::Recover(bool* save_manifest) {
-    std::string current_path = dbname_ + "/CURRENT";
+    if (save_manifest == nullptr) {
+        return Status::InvalidArgument("Null save_manifest argument");
+    }
+    *save_manifest = false;
+    if (descriptor_log_ != nullptr) {
+        return Status::InvalidArgument("Cannot recover an active VersionSet");
+    }
 
+    const std::string current_path = dbname_ + "/CURRENT";
     std::error_code ec;
     const bool exists = std::filesystem::exists(current_path, ec);
-    if(ec) {
-        return Status::IOError("Cannot check CURRENT file ");
-    }
-    if(!exists) {
-        return Status::NotFound("CURRENT file does not exist.");
-    }
+    if (ec) return Status::IOError("Cannot check CURRENT file");
+    if (!exists) return Status::NotFound("CURRENT file does not exist");
 
     std::ifstream in(current_path);
-    if (!in.is_open()) {
-        return Status::NotFound("Cannot open CURRENT file ");
-    }
+    if (!in.is_open()) return Status::IOError("Cannot open CURRENT file");
 
     std::string manifest_filename;
     in >> manifest_filename;
+    if (in.bad()) return Status::IOError("Cannot read CURRENT file");
     if (manifest_filename.empty()) {
         return Status::Corruption("CURRENT file is empty");
     }
-    if (!manifest_filename.empty() && manifest_filename.back() == '\n') {
-        manifest_filename.pop_back();
+    // CURRENT 必须只包含本目录中的 MANIFEST 文件名。
+    const std::string prefix = "MANIFEST-";
+    if (manifest_filename.compare(0, prefix.size(), prefix) != 0 ||
+        manifest_filename.size() == prefix.size() ||
+        manifest_filename.find_first_not_of("0123456789", prefix.size()) !=
+            std::string::npos) {
+        return Status::Corruption("Invalid MANIFEST name in CURRENT");
     }
+    std::string extra;
+    if (in >> extra) return Status::Corruption("Extra content in CURRENT");
+    if (in.bad()) return Status::IOError("Cannot read CURRENT file");
 
-    std::string manifest_path = dbname_ + "/" + manifest_filename;
-    SequentialFile* manifest_file = nullptr;
-    Status s = NewSequentialFile(manifest_path, &manifest_file);
+    SequentialFile* raw_file = nullptr;
+    Status s = NewSequentialFile(dbname_ + "/" + manifest_filename, &raw_file);
     if (!s.ok()) return s;
+    std::unique_ptr<SequentialFile> manifest_file(raw_file);
+    ManifestReporter reporter;
+    log::Reader reader(manifest_file.get(), &reporter, true, 0);
 
-    log::Reader reader(manifest_file, nullptr, /*checksum=*/true, 0);
+    auto v = std::make_shared<Version>(this);
+    uint64_t recovered_log = 0;
+    uint64_t recovered_next = 2;
+    uint64_t recovered_sequence = 0;
+    uint64_t largest_file_number = 0;
+    bool has_log = false;
+    bool has_next = false;
+    bool has_sequence = false;
+    constexpr uint64_t kMaxSequence = (uint64_t{1} << 56) - 1;
+
     Slice record;
     std::string scratch;
-
-    // 将所有 VersionEdit 依次重放到一个新 Version 上，最终得到最新的文件集合。
-    std::shared_ptr<Version> v = std::make_shared<Version>(this);
-    
-
     while (reader.ReadRecord(&record, &scratch)) {
+        // 旧版 Reader 可能跳过坏记录后返回下一条；必须先检查 Reporter。
+        if (!reporter.status.ok()) return reporter.status;
         VersionEdit edit;
         s = edit.DecodeFrom(record);
-        if (!s.ok()) break;
+        if (!s.ok()) return s;
 
-        if (edit.has_log_number_)       log_number_       = edit.log_number_;
-        if (edit.has_next_file_number_) next_file_number_ = edit.next_file_number_;
-        if (edit.has_last_sequence_)    last_sequence_    = edit.last_sequence_;
+        if (edit.has_log_number_) {
+            if (has_log && edit.log_number_ < recovered_log) {
+                return Status::Corruption("Decreasing WAL number in MANIFEST");
+            }
+            recovered_log = edit.log_number_;
+            has_log = true;
+        }
+        if (edit.has_next_file_number_) {
+            if (has_next && edit.next_file_number_ < recovered_next) {
+                return Status::Corruption("Decreasing next file number");
+            }
+            recovered_next = edit.next_file_number_;
+            has_next = true;
+        }
+        if (edit.has_last_sequence_) {
+            if (edit.last_sequence_ > kMaxSequence ||
+                (has_sequence && edit.last_sequence_ < recovered_sequence)) {
+                return Status::Corruption("Invalid sequence in MANIFEST");
+            }
+            recovered_sequence = edit.last_sequence_;
+            has_sequence = true;
+        }
 
         for (const auto& del : edit.deleted_files_) {
             const int level = del.first;
             const uint64_t number = del.second;
-
-            if(level < 0 || level >= kNumLevels) {
-                s = Status::Corruption("Invalid level in deleted_files");
-                break;
+            if (level < 0 || level >= kNumLevels) {
+                return Status::Corruption("Invalid deleted-file level");
             }
-
+            largest_file_number = std::max(largest_file_number, number);
             auto& files = v->files_[level];
             files.erase(std::remove_if(files.begin(), files.end(),
-                                       [number](const std::shared_ptr<FileMetaData>& file) {
-                                           return file->number == number;
-                                       }),
-                        files.end());
+                                       [number](const std::shared_ptr<FileMetaData>& f) {
+                                           return f->number == number;
+                                       }), files.end());
         }
-
-        if(!s.ok()) break;
-
         for (const auto& added : edit.new_files_) {
-            const int level = added.first;
-            if(level < 0 || level >= kNumLevels) {
-                s = Status::Corruption("Invalid level in new_files");
-                break;
-            }
-
+            s = ValidateFileMetadata(added.first, added.second, icmp_);
+            if (!s.ok()) return s;
             const auto& metadata = added.second;
-            auto& files = v->files_[level];
-
-            // 同一层的同一文件编号只保留一份
+            largest_file_number = std::max(largest_file_number, metadata.number);
+            auto& files = v->files_[added.first];
             files.erase(std::remove_if(files.begin(), files.end(),
-                               [&metadata](const std::shared_ptr<FileMetaData>& file) {
-                                   return file->number == metadata.number;
-                               }),
-                    files.end());
-            
+                                       [&metadata](const std::shared_ptr<FileMetaData>& f) {
+                                           return f->number == metadata.number;
+                                       }), files.end());
             files.push_back(std::make_shared<FileMetaData>(metadata));
         }
     }
-    
-    if(!s.ok()) break;
-
-    delete manifest_file;
-
-    if (s.ok()) {
-         // L1 及以上的读路径依赖文件边界有序。
-        for (int level = 1; level < kNumLevels; ++level) {
-            auto& files = v->files_[level];
-            std::sort(
-                files.begin(), files.end(),
-                [this](const std::shared_ptr<FileMetaData>& a,
-                    const std::shared_ptr<FileMetaData>& b) {
-                    return icmp_->Compare(
-                        Slice(a->smallest), Slice(b->smallest)) < 0;
-            });
-        }
-        current_ = v;
-
-        // 恢复后没有继续打开旧 MANIFEST 写入，
-        // 后续首次 LogAndApply 需要创建新的 MANIFEST。
-        *save_manifest = true;
-
+    if (!reporter.status.ok()) return reporter.status;
+    if (!has_log || !has_next || !has_sequence) {
+        return Status::Corruption("MANIFEST lacks required metadata");
+    }
+    if (recovered_next < 2 || recovered_next <= recovered_log ||
+        recovered_next <= largest_file_number) {
+        return Status::Corruption("Invalid next file number in MANIFEST");
     }
 
-    return s;
+    for (int level = 1; level < kNumLevels; ++level) {
+        auto& files = v->files_[level];
+        std::sort(files.begin(), files.end(),
+                  [this](const std::shared_ptr<FileMetaData>& a,
+                         const std::shared_ptr<FileMetaData>& b) {
+                      return icmp_->Compare(Slice(a->smallest), Slice(b->smallest)) < 0;
+                  });
+    }
+
+    // 全部恢复成功后，才发布文件视图和标量元数据。
+    current_ = v;
+    log_number_ = recovered_log;
+    next_file_number_ = recovered_next;
+    last_sequence_ = recovered_sequence;
+    *save_manifest = true;
+    return Status::OK();
 }
 
 // --------------------------------------------------------------------------

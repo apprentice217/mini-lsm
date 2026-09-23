@@ -33,8 +33,10 @@ public:
     // 核心接口：读取一条完整的逻辑记录
     // 如果记录跨越了 Block，将使用 scratch 拼接；
     // 否则 record 直接指向底层物理 Buffer，实现零拷贝。
-    // 返回值：true 表示成功读取一条数据；false 表示到达文件尾部。
+    // 返回值：true 表示成功读取一条数据；false 表示读取结束或发生错误，需要检查status_。
     bool ReadRecord(Slice* record, std::string* scratch);
+
+    Status status() const { return status_; }
 
 private:
     enum {
@@ -60,6 +62,8 @@ private:
 
     // 指示是否已经到达文件末尾
     bool eof_;
+
+    Status status_ = Status::OK();
 };
 
 } // namespace log

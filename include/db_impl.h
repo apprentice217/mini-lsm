@@ -26,6 +26,7 @@ struct Compaction;
 class DBImpl : public DB {
 public:
     DBImpl(const Options& options, const std::string& dbname);
+    Status Init();
     ~DBImpl() override;
 
     Status Put(const WriteOptions& options, const Slice& key, const Slice& value) override;

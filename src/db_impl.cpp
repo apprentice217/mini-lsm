@@ -21,6 +21,93 @@
 
 namespace minidb
 {
+    Status DecodeWalBatch(const Slice &record, uint64_t *first_sequence, WriteBatch *batch)
+    {
+        batch->Clear();
+
+        if (record.size() < 12)
+        {
+            return Status::Corruption("WAL record too short");
+        }
+
+        const uint64_t seq = DecodeFixed64(record.data());
+        const uint32_t count = DecodeFixed32(record.data() + 8);
+        constexpr uint64_t kMaxSequence = (uint64_t(1) << 56) - 1;
+
+        if (count > 0)
+        {
+            if (seq == 0 || seq > kMaxSequence)
+            {
+                return Status::Corruption("invalid WAL sequence ");
+            }
+
+            if (static_cast<uint64_t>(count - 1) > kMaxSequence - seq)
+            {
+                return Status::Corruption("WAL sequence overflow");
+            }
+        }
+
+        const char *p = record.data() + 12;
+        const char *limit = record.data() + record.size();
+
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (p == limit)
+            {
+                return Status::Corruption("WAL batch has too few records");
+            }
+
+            const uint8_t type = static_cast<uint8_t>(*p++);
+            if (type != kTypeValue && type != kTypeDeletion)
+            {
+                return Status::Corruption("Invalid WAL record type");
+            }
+
+            uint32_t key_size = 0;
+            if (!GetVarint32(&p, limit, &key_size))
+            {
+                return Status::Corruption("Invalid WAL key length");
+            }
+
+            if (key_size > static_cast<size_t>(limit - p))
+            {
+                return Status::Corruption("Truncated WAL key");
+            }
+
+            Slice key(p, key_size);
+            p += key_size;
+
+            if (type == kTypeValue)
+            {
+                uint32_t value_size = 0;
+                if (!GetVarint32(&p, limit, &value_size))
+                {
+                    return Status::Corruption("Invalid WAL value length");
+                }
+
+                if (value_size > static_cast<size_t>(limit - p))
+                {
+                    return Status::Corruption("Truncated WAL value");
+                }
+
+                Slice value(p, value_size);
+                p += value_size;
+                batch->Put(key, value);
+            }
+            else
+            {
+                batch->Delete(key);
+            }
+        }
+
+        if (p != limit)
+        {
+            return Status::Corruption("WAL batch has trailing bytes");
+        }
+
+        *first_sequence = seq;
+        return Status::OK();
+    }
 
     DBImpl::DBImpl(const Options &options, const std::string &dbname)
         : options_(options),
@@ -31,7 +118,7 @@ namespace minidb
           mem_(nullptr),
           imm_(nullptr), logfile_(nullptr), log_(nullptr),
           internal_comparator_(options.comparator),
-          table_cache_(nullptr), versions_(nullptr),
+          table_cache_(nullptr), versions_(nullptr)
     {
     }
 
@@ -85,59 +172,54 @@ namespace minidb
                 std::snprintf(buf, sizeof(buf), "%s/%06llu.log",
                               dbname_.c_str(), (unsigned long long)log_num);
 
-                SequentialFile *log_file = nullptr;
-                s = NewSequentialFile(buf, &log_file);
+                SequentialFile *raw_file = nullptr;
+                s = NewSequentialFile(buf, &raw_file);
                 if (!s.ok())
                     return s;
 
-                log::Reader reader(log_file, nullptr, /*checksum=*/true, 0);
+                // 后续任何位置返回错误，都能自动释放文件。
+                std::unique_ptr<SequentialFile> log_file(raw_file);
+
+                log::Reader reader(
+                    log_file.get(), nullptr, /*checksum=*/true, 0);
+
                 Slice record;
                 std::string scratch;
 
-                // 每条 WAL record 的格式：[seq: 8B][count: 4B][record...]
-                // 与 Write() 中序列化格式保持一致。
                 while (reader.ReadRecord(&record, &scratch))
                 {
-                    if (record.size() < 12)
-                        continue;
+                    WriteBatch batch;
+                    uint64_t first_sequence = 0;
 
-                    uint64_t seq = DecodeFixed64(record.data());
-                    uint32_t count = DecodeFixed32(record.data() + 8);
-
-                    const char *p = record.data() + 12;
-                    const char *limit = record.data() + record.size();
-
-                    for (uint32_t i = 0; i < count; i++)
+                    s = DecodeWalBatch(record, &first_sequence, &batch);
+                    if (!s.ok())
                     {
-                        if (p >= limit)
-                            break;
-                        char type = *p++;
-                        uint32_t key_len;
+                        return s;
+                    }
 
-                        if (!GetVarint32(&p, limit, &key_len) || p + key_len > limit)
-                            break;
-                        Slice key(p, key_len);
-                        p += key_len;
+                    // 完整批次校验成功后，才更新 MemTable。
+                    uint64_t seq = first_sequence;
 
-                        if (type == kTypeValue)
-                        {
-                            uint32_t val_len;
-                            if (!GetVarint32(&p, limit, &val_len) || p + val_len > limit)
-                                break;
-                            Slice value(p, val_len);
-                            p += val_len;
-                            mem_->Add(seq, type, key, value);
-                        }
-                        else
-                        {
-                            // kTypeDeletion 无 value 字段。
-                            mem_->Add(seq, type, key, Slice());
-                        }
+                    for (const auto &item : batch.Records())
+                    {
+                        const uint32_t type =
+                            item.type == BatchValueType::kTypeValue
+                                ? kTypeValue
+                                : kTypeDeletion;
+
+                        mem_->Add(seq, type, Slice(item.key), Slice(item.value));
+
                         last_sequence_ = std::max(last_sequence_, seq);
                         ++seq;
                     }
                 }
-                delete log_file;
+
+                // false 不一定表示正常 EOF，必须检查读取状态。
+                s = reader.status();
+                if (!s.ok())
+                {
+                    return s;
+                }
             }
         }
 
@@ -707,11 +789,11 @@ namespace minidb
 
         mutex_.lock();
 
-        if(!background_error_.ok())
+        if (!background_error_.ok())
         {
             return background_error_;
         }
-        
+
         if (s.ok())
         {
             // 将输入文件从 VersionEdit 中标记为删除，输出文件登记为新增。
