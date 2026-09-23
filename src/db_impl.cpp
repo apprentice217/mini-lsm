@@ -124,6 +124,11 @@ namespace minidb
 
     Status DBImpl::Init()
     {
+        FileLock* raw_lock = nullptr;
+        Status lock_status = LockFile(dbname_ + "/LOCK", &raw_lock);
+        if (!lock_status.ok()) return lock_status;
+        db_lock_.reset(raw_lock);
+
         // InternalKeyComparator 封装了用户比较器，额外处理序列号降序。
         // 所有内部组件统一使用 internal_options，避免用户比较器泄漏到磁盘格式层。
         Options internal_options = options_;
@@ -234,7 +239,9 @@ namespace minidb
             std::snprintf(buf, sizeof(buf), "%s/%06llu.log",
                           dbname_.c_str(), (unsigned long long)new_log_number);
 
-            s = NewWritableFile(buf, (WritableFile **)&logfile_);
+            s = NewWritableFile(buf, &logfile_);
+            if (s.ok()) s = logfile_->Sync();
+            if (s.ok()) s = SyncDir(dbname_);
             if (s.ok())
             {
                 log_ = new log::Writer(logfile_);
@@ -431,6 +438,10 @@ namespace minidb
                 if (!s.ok())
                     return s;
 
+                s = new_file->Sync();
+                if (s.ok()) s = SyncDir(dbname_);
+                if (!s.ok()) return s; // 尚未切换 WAL，原来的写入状态仍然有效。
+
                 auto new_log = std::make_unique<log::Writer>(new_file.get());
 
                 // 保留当前恢复起点。
@@ -616,6 +627,7 @@ namespace minidb
         }
         delete builder;
         delete sst_file;
+        if (s.ok()) s = SyncDir(dbname_); // 登记 SST 前先持久化文件名。
 
         mutex_.lock();
         // 锁外写 SST 期间，前台可能已经报告 WAL 错误。
@@ -786,6 +798,7 @@ namespace minidb
         {
             s = FinishOutputFile();
         }
+        if (s.ok() && !output_files.empty()) s = SyncDir(dbname_);
 
         mutex_.lock();
 
@@ -828,17 +841,7 @@ namespace minidb
     {
         // 收集当前所有 Version 中仍被引用的文件编号。
         std::set<uint64_t> live_files;
-        std::shared_ptr<Version> cur = versions_->current();
-        if (cur != nullptr)
-        {
-            for (int level = 0; level < kNumLevels; ++level)
-            {
-                for (const auto &f : cur->files(level))
-                {
-                    live_files.insert(f->number);
-                }
-            }
-        }
+        versions_->AddLiveFiles(&live_files);
 
         // 扫描目录，删除 .sst 文件中不在 live_files 中的，以及过时的 .log 文件。
         std::error_code ec;
@@ -922,6 +925,25 @@ namespace minidb
     // NewIterator
     // --------------------------------------------------------------------------
 
+    // 在子迭代器销毁之后释放 Version，避免遍历期间 SST 被清理。
+    class VersionIterator final : public Iterator {
+    public:
+        VersionIterator(std::shared_ptr<Version> version, Iterator* child)
+            : version_(std::move(version)), child_(child) {}
+        bool Valid() const override { return child_->Valid(); }
+        void SeekToFirst() override { child_->SeekToFirst(); }
+        void SeekToLast() override { child_->SeekToLast(); }
+        void Seek(const Slice& key) override { child_->Seek(key); }
+        void Next() override { child_->Next(); }
+        void Prev() override { child_->Prev(); }
+        Slice key() const override { return child_->key(); }
+        Slice value() const override { return child_->value(); }
+        Status status() const override { return child_->status(); }
+    private:
+        std::shared_ptr<Version> version_;
+        std::unique_ptr<Iterator> child_;
+    };
+
     // NewIterator 构造一个覆盖 MemTable + Immutable MemTable + 所有 Level SSTable 的 MergingIterator。
     // 迭代器仅能看到 snapshot_seq 及以下的数据版本（通过 InternalKey 比较隐式实现）。
     Iterator *DBImpl::NewIterator(const ReadOptions &options)
@@ -952,7 +974,8 @@ namespace minidb
             }
         }
 
-        return new MergingIterator(&internal_comparator_, std::move(iters));
+        return new VersionIterator(std::move(current_version),
+            new MergingIterator(&internal_comparator_, std::move(iters)));
     }
 
     // --------------------------------------------------------------------------
@@ -1031,6 +1054,18 @@ namespace minidb
             {
                 return Status::IOError("Failed to create DB directory: " + name);
             }
+        }
+
+        // 同步祖先目录，保证新建的数据库目录（包括递归创建的父目录）可恢复。
+        // 对已存在的目录也执行，覆盖上一次建目录后同步失败的重试。
+        auto parent = std::filesystem::absolute(name, ec).lexically_normal().parent_path();
+        if (ec) return Status::IOError("Cannot resolve DB directory: " + ec.message());
+        while (!parent.empty()) {
+            Status s = SyncDir(parent.string());
+            if (!s.ok()) return s;
+            auto next = parent.parent_path();
+            if (next == parent) break;
+            parent = std::move(next);
         }
 
         auto impl = std::make_unique<DBImpl>(options, name);

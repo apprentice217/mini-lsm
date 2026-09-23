@@ -7,6 +7,7 @@
 #include "db_format.h"
 #include "snapshot.h"
 #include <mutex>
+#include <memory>
 #include <condition_variable>
 #include <thread>
 #include <string>
@@ -70,6 +71,9 @@ private:
 
     const Options     options_;
     const std::string dbname_;
+
+    // 析构函数完成后台线程和文件清理后，才释放目录锁。
+    std::unique_ptr<FileLock> db_lock_;
 
     std::mutex              mutex_;
     std::condition_variable bg_cv_;

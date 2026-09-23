@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <cerrno>
 #include <cstring>
 #include <string>
@@ -11,6 +12,43 @@
 #include <cstdlib>
 
 namespace minidb {
+
+namespace {
+class PosixFileLock final : public FileLock {
+public:
+    explicit PosixFileLock(int fd) : fd_(fd) {}
+    ~PosixFileLock() override { close(fd_); }
+private:
+    int fd_;
+};
+}  // namespace
+
+Status LockFile(const std::string& filename, FileLock** result) {
+    *result = nullptr;
+    int fd = open(filename.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return Status::IOError("open lock " + filename + ": " + strerror(errno));
+    int rc;
+    do { rc = flock(fd, LOCK_EX | LOCK_NB); } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        const std::string message = "lock " + filename + ": " + strerror(errno);
+        close(fd);
+        return Status::IOError(message);
+    }
+    *result = new PosixFileLock(fd);
+    return Status::OK();
+}
+
+Status SyncDir(const std::string& dirname) {
+    int fd = open(dirname.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return Status::IOError("open directory " + dirname + ": " + strerror(errno));
+    int rc;
+    do { rc = fsync(fd); } while (rc < 0 && errno == EINTR);
+    const int saved_errno = errno;
+    const int close_rc = close(fd);
+    if (rc < 0) return Status::IOError("sync directory " + dirname + ": " + strerror(saved_errno));
+    if (close_rc < 0) return Status::IOError("close directory " + dirname + ": " + strerror(errno));
+    return Status::OK();
+}
 
 // ---------------------------------------------------------------------------
 // PosixWritableFile：顺序写文件，用于 WAL 和 SSTable 的落盘。

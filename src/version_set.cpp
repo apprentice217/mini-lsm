@@ -48,7 +48,7 @@ Status ValidateFileMetadata(int level, const FileMetaData& file,
 } // namespace
 
 // 先写入并同步临时文件，再通过 rename 替换 CURRENT。
-// 这里尚未同步目录，不能据此宣称整条路径已经具备断电持久性。
+// rename 后同步目录，确认 CURRENT 的新目录项已持久化。
 static Status SetCurrentFile(const std::string& dbname,
                              uint64_t descriptor_number) {
     char name[64];
@@ -72,7 +72,7 @@ static Status SetCurrentFile(const std::string& dbname,
     if (std::rename(tmp.c_str(), current.c_str()) != 0) {
         return Status::IOError("Cannot rename CURRENT.tmp to CURRENT");
     }
-    return Status::OK();
+    return SyncDir(dbname);
 }
 
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
@@ -87,7 +87,29 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       log_number_(0),
       descriptor_file_(nullptr),
       descriptor_log_(nullptr) {
-    current_ = std::make_shared<Version>(this);
+    InstallVersion(std::make_shared<Version>(this));
+}
+
+void VersionSet::InstallVersion(std::shared_ptr<Version> version) {
+    current_ = std::move(version);
+    versions_.erase(std::remove_if(versions_.begin(), versions_.end(),
+        [](const std::weak_ptr<Version>& v) { return v.expired(); }), versions_.end());
+    versions_.push_back(current_);
+}
+
+void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
+    auto it = versions_.begin();
+    while (it != versions_.end()) {
+        auto version = it->lock();
+        if (!version) {
+            it = versions_.erase(it);
+            continue;
+        }
+        for (int level = 0; level < kNumLevels; ++level) {
+            for (const auto& file : version->files(level)) live->insert(file->number);
+        }
+        ++it;
+    }
 }
 
 VersionSet::~VersionSet() {
@@ -233,6 +255,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
         if(s.ok()) {
             s=new_file->Sync();
         }
+        if (s.ok()) s = SyncDir(dbname_); // 先持久化 MANIFEST 文件名，再发布 CURRENT。
         if(s.ok()) {
             s=SetCurrentFile(dbname_, new_manifest_file_number);
         }
@@ -259,7 +282,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
     assert(edit->has_log_number_);
     assert(edit->log_number_ >= log_number_);
 
-    current_ = v;
+    InstallVersion(v);
     log_number_ = edit->log_number_;
 
     return Status::OK();
@@ -396,7 +419,7 @@ Status VersionSet::Recover(bool* save_manifest) {
     }
 
     // 全部恢复成功后，才发布文件视图和标量元数据。
-    current_ = v;
+    InstallVersion(v);
     log_number_ = recovered_log;
     next_file_number_ = recovered_next;
     last_sequence_ = recovered_sequence;

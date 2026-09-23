@@ -62,7 +62,13 @@ Status NewRandomAccessFile(const std::string& filename, RandomAccessFile** resul
 Status NewSequentialFile(const std::string& fname, SequentialFile** result);
 
 
-// 另外，确保也有这个写文件接口（LogAndApply 写 MANIFEST 需要）
-Status NewWritableFile(const std::string& fname, class WritableFile** result);
+// 锁对象存活期间保持目录独占；释放时不能删除 LOCK 文件。
+class FileLock {
+public:
+    virtual ~FileLock() = default;
+};
+Status LockFile(const std::string& filename, FileLock** result);
+// 持久化目录项（文件创建、重命名等），失败必须向上传递。
+Status SyncDir(const std::string& dirname);
 
 } // namespace minidb

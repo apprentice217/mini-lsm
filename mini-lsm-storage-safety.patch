@@ -1,0 +1,658 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 25c15fa..e0dcf70 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -82,4 +82,10 @@ add_test(NAME db_bench COMMAND db_bench)
+ add_test(NAME db_correctness COMMAND db_correctness)
+ add_test(NAME db_bench_mt COMMAND db_bench_mt)
+ add_test(NAME memtable_ds_bench COMMAND memtable_ds_bench)
+-add_test(NAME compaction_ab_bench COMMAND compaction_ab_bench)
+\ No newline at end of file
++add_test(NAME compaction_ab_bench COMMAND compaction_ab_bench)
++# Linux syscall wrappers cover durability ordering and injected fsync failures.
++if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    add_executable(storage_safety_test tests/storage_safety_test.cpp)
++    target_link_libraries(storage_safety_test minidb "-Wl,--wrap=fsync" "-Wl,--wrap=rename")
++    add_test(NAME storage_safety_test COMMAND storage_safety_test)
++endif()
+diff --git a/include/db_impl.h b/include/db_impl.h
+index 8381824..e9ec642 100644
+--- a/include/db_impl.h
++++ b/include/db_impl.h
+@@ -7,6 +7,7 @@
+ #include "db_format.h"
+ #include "snapshot.h"
+ #include <mutex>
++#include <memory>
+ #include <condition_variable>
+ #include <thread>
+ #include <string>
+@@ -71,6 +72,9 @@ private:
+     const Options     options_;
+     const std::string dbname_;
+ 
++    // 析构函数完成后台线程和文件清理后，才释放目录锁。
++    std::unique_ptr<FileLock> db_lock_;
++
+     std::mutex              mutex_;
+     std::condition_variable bg_cv_;
+     bool                    shutting_down_;
+diff --git a/include/env.h b/include/env.h
+index 751b487..0809593 100644
+--- a/include/env.h
++++ b/include/env.h
+@@ -62,7 +62,13 @@ Status NewRandomAccessFile(const std::string& filename, RandomAccessFile** resul
+ Status NewSequentialFile(const std::string& fname, SequentialFile** result);
+ 
+ 
+-// 另外，确保也有这个写文件接口（LogAndApply 写 MANIFEST 需要）
+-Status NewWritableFile(const std::string& fname, class WritableFile** result);
++// 锁对象存活期间保持目录独占；释放时不能删除 LOCK 文件。
++class FileLock {
++public:
++    virtual ~FileLock() = default;
++};
++Status LockFile(const std::string& filename, FileLock** result);
++// 持久化目录项（文件创建、重命名等），失败必须向上传递。
++Status SyncDir(const std::string& dirname);
+ 
+ } // namespace minidb
+\ No newline at end of file
+diff --git a/include/version_set.h b/include/version_set.h
+index bc084a0..1d58a52 100644
+--- a/include/version_set.h
++++ b/include/version_set.h
+@@ -3,6 +3,7 @@
+ #include <string>
+ #include <vector>
+ #include <memory>
++#include <set>
+ #include "status.h"
+ #include "slice.h"
+ #include "version_edit.h"
+@@ -81,6 +82,9 @@ public:
+ 
+     std::shared_ptr<Version> current() const { return current_; }
+ 
++    // 与版本发布一样，由调用者持有 DB mutex；包括正在被旧读请求使用的版本。
++    void AddLiveFiles(std::set<uint64_t>* live);
++
+     // PickCompaction 根据当前各层文件状况选取一次 compaction 任务。
+     // 若不需要 compaction 则返回 nullptr。
+     // 触发条件：L0 文件数 >= l0_compaction_trigger，或 L1+ 总字节数超出阈值。
+@@ -114,7 +118,9 @@ private:
+     uint64_t last_sequence_;
+     uint64_t log_number_;
+ 
++    void InstallVersion(std::shared_ptr<Version> version);
+     std::shared_ptr<Version> current_;
++    std::vector<std::weak_ptr<Version>> versions_;
+ 
+     WritableFile*  descriptor_file_;
+     log::Writer*   descriptor_log_;
+diff --git a/src/db_impl.cpp b/src/db_impl.cpp
+index 644883d..92b5e3f 100644
+--- a/src/db_impl.cpp
++++ b/src/db_impl.cpp
+@@ -124,6 +124,11 @@ namespace minidb
+ 
+     Status DBImpl::Init()
+     {
++        FileLock* raw_lock = nullptr;
++        Status lock_status = LockFile(dbname_ + "/LOCK", &raw_lock);
++        if (!lock_status.ok()) return lock_status;
++        db_lock_.reset(raw_lock);
++
+         // InternalKeyComparator 封装了用户比较器，额外处理序列号降序。
+         // 所有内部组件统一使用 internal_options，避免用户比较器泄漏到磁盘格式层。
+         Options internal_options = options_;
+@@ -234,7 +239,9 @@ namespace minidb
+             std::snprintf(buf, sizeof(buf), "%s/%06llu.log",
+                           dbname_.c_str(), (unsigned long long)new_log_number);
+ 
+-            s = NewWritableFile(buf, (WritableFile **)&logfile_);
++            s = NewWritableFile(buf, &logfile_);
++            if (s.ok()) s = logfile_->Sync();
++            if (s.ok()) s = SyncDir(dbname_);
+             if (s.ok())
+             {
+                 log_ = new log::Writer(logfile_);
+@@ -431,6 +438,10 @@ namespace minidb
+                 if (!s.ok())
+                     return s;
+ 
++                s = new_file->Sync();
++                if (s.ok()) s = SyncDir(dbname_);
++                if (!s.ok()) return s; // 尚未切换 WAL，原来的写入状态仍然有效。
++
+                 auto new_log = std::make_unique<log::Writer>(new_file.get());
+ 
+                 // 保留当前恢复起点。
+@@ -616,6 +627,7 @@ namespace minidb
+         }
+         delete builder;
+         delete sst_file;
++        if (s.ok()) s = SyncDir(dbname_); // 登记 SST 前先持久化文件名。
+ 
+         mutex_.lock();
+         // 锁外写 SST 期间，前台可能已经报告 WAL 错误。
+@@ -786,6 +798,7 @@ namespace minidb
+         {
+             s = FinishOutputFile();
+         }
++        if (s.ok() && !output_files.empty()) s = SyncDir(dbname_);
+ 
+         mutex_.lock();
+ 
+@@ -828,17 +841,7 @@ namespace minidb
+     {
+         // 收集当前所有 Version 中仍被引用的文件编号。
+         std::set<uint64_t> live_files;
+-        std::shared_ptr<Version> cur = versions_->current();
+-        if (cur != nullptr)
+-        {
+-            for (int level = 0; level < kNumLevels; ++level)
+-            {
+-                for (const auto &f : cur->files(level))
+-                {
+-                    live_files.insert(f->number);
+-                }
+-            }
+-        }
++        versions_->AddLiveFiles(&live_files);
+ 
+         // 扫描目录，删除 .sst 文件中不在 live_files 中的，以及过时的 .log 文件。
+         std::error_code ec;
+@@ -922,6 +925,25 @@ namespace minidb
+     // NewIterator
+     // --------------------------------------------------------------------------
+ 
++    // 在子迭代器销毁之后释放 Version，避免遍历期间 SST 被清理。
++    class VersionIterator final : public Iterator {
++    public:
++        VersionIterator(std::shared_ptr<Version> version, Iterator* child)
++            : version_(std::move(version)), child_(child) {}
++        bool Valid() const override { return child_->Valid(); }
++        void SeekToFirst() override { child_->SeekToFirst(); }
++        void SeekToLast() override { child_->SeekToLast(); }
++        void Seek(const Slice& key) override { child_->Seek(key); }
++        void Next() override { child_->Next(); }
++        void Prev() override { child_->Prev(); }
++        Slice key() const override { return child_->key(); }
++        Slice value() const override { return child_->value(); }
++        Status status() const override { return child_->status(); }
++    private:
++        std::shared_ptr<Version> version_;
++        std::unique_ptr<Iterator> child_;
++    };
++
+     // NewIterator 构造一个覆盖 MemTable + Immutable MemTable + 所有 Level SSTable 的 MergingIterator。
+     // 迭代器仅能看到 snapshot_seq 及以下的数据版本（通过 InternalKey 比较隐式实现）。
+     Iterator *DBImpl::NewIterator(const ReadOptions &options)
+@@ -952,7 +974,8 @@ namespace minidb
+             }
+         }
+ 
+-        return new MergingIterator(&internal_comparator_, std::move(iters));
++        return new VersionIterator(std::move(current_version),
++            new MergingIterator(&internal_comparator_, std::move(iters)));
+     }
+ 
+     // --------------------------------------------------------------------------
+@@ -1033,6 +1056,18 @@ namespace minidb
+             }
+         }
+ 
++        // 同步祖先目录，保证新建的数据库目录（包括递归创建的父目录）可恢复。
++        // 对已存在的目录也执行，覆盖上一次建目录后同步失败的重试。
++        auto parent = std::filesystem::absolute(name, ec).lexically_normal().parent_path();
++        if (ec) return Status::IOError("Cannot resolve DB directory: " + ec.message());
++        while (!parent.empty()) {
++            Status s = SyncDir(parent.string());
++            if (!s.ok()) return s;
++            auto next = parent.parent_path();
++            if (next == parent) break;
++            parent = std::move(next);
++        }
++
+         auto impl = std::make_unique<DBImpl>(options, name);
+         Status s = impl->Init();
+         if (!s.ok())
+diff --git a/src/env_posix.cpp b/src/env_posix.cpp
+index a6551a3..8285713 100644
+--- a/src/env_posix.cpp
++++ b/src/env_posix.cpp
+@@ -4,6 +4,7 @@
+ #include <unistd.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
++#include <sys/file.h>
+ #include <cerrno>
+ #include <cstring>
+ #include <string>
+@@ -12,6 +13,43 @@
+ 
+ namespace minidb {
+ 
++namespace {
++class PosixFileLock final : public FileLock {
++public:
++    explicit PosixFileLock(int fd) : fd_(fd) {}
++    ~PosixFileLock() override { close(fd_); }
++private:
++    int fd_;
++};
++}  // namespace
++
++Status LockFile(const std::string& filename, FileLock** result) {
++    *result = nullptr;
++    int fd = open(filename.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++    if (fd < 0) return Status::IOError("open lock " + filename + ": " + strerror(errno));
++    int rc;
++    do { rc = flock(fd, LOCK_EX | LOCK_NB); } while (rc < 0 && errno == EINTR);
++    if (rc < 0) {
++        const std::string message = "lock " + filename + ": " + strerror(errno);
++        close(fd);
++        return Status::IOError(message);
++    }
++    *result = new PosixFileLock(fd);
++    return Status::OK();
++}
++
++Status SyncDir(const std::string& dirname) {
++    int fd = open(dirname.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    if (fd < 0) return Status::IOError("open directory " + dirname + ": " + strerror(errno));
++    int rc;
++    do { rc = fsync(fd); } while (rc < 0 && errno == EINTR);
++    const int saved_errno = errno;
++    const int close_rc = close(fd);
++    if (rc < 0) return Status::IOError("sync directory " + dirname + ": " + strerror(saved_errno));
++    if (close_rc < 0) return Status::IOError("close directory " + dirname + ": " + strerror(errno));
++    return Status::OK();
++}
++
+ // ---------------------------------------------------------------------------
+ // PosixWritableFile：顺序写文件，用于 WAL 和 SSTable 的落盘。
+ //
+diff --git a/src/version_set.cpp b/src/version_set.cpp
+index 2436e68..7771d35 100644
+--- a/src/version_set.cpp
++++ b/src/version_set.cpp
+@@ -48,7 +48,7 @@ Status ValidateFileMetadata(int level, const FileMetaData& file,
+ } // namespace
+ 
+ // 先写入并同步临时文件，再通过 rename 替换 CURRENT。
+-// 这里尚未同步目录，不能据此宣称整条路径已经具备断电持久性。
++// rename 后同步目录，确认 CURRENT 的新目录项已持久化。
+ static Status SetCurrentFile(const std::string& dbname,
+                              uint64_t descriptor_number) {
+     char name[64];
+@@ -72,7 +72,7 @@ static Status SetCurrentFile(const std::string& dbname,
+     if (std::rename(tmp.c_str(), current.c_str()) != 0) {
+         return Status::IOError("Cannot rename CURRENT.tmp to CURRENT");
+     }
+-    return Status::OK();
++    return SyncDir(dbname);
+ }
+ 
+ VersionSet::VersionSet(const std::string& dbname, const Options* options,
+@@ -87,7 +87,29 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
+       log_number_(0),
+       descriptor_file_(nullptr),
+       descriptor_log_(nullptr) {
+-    current_ = std::make_shared<Version>(this);
++    InstallVersion(std::make_shared<Version>(this));
++}
++
++void VersionSet::InstallVersion(std::shared_ptr<Version> version) {
++    current_ = std::move(version);
++    versions_.erase(std::remove_if(versions_.begin(), versions_.end(),
++        [](const std::weak_ptr<Version>& v) { return v.expired(); }), versions_.end());
++    versions_.push_back(current_);
++}
++
++void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
++    auto it = versions_.begin();
++    while (it != versions_.end()) {
++        auto version = it->lock();
++        if (!version) {
++            it = versions_.erase(it);
++            continue;
++        }
++        for (int level = 0; level < kNumLevels; ++level) {
++            for (const auto& file : version->files(level)) live->insert(file->number);
++        }
++        ++it;
++    }
+ }
+ 
+ VersionSet::~VersionSet() {
+@@ -233,6 +255,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
+         if(s.ok()) {
+             s=new_file->Sync();
+         }
++        if (s.ok()) s = SyncDir(dbname_); // 先持久化 MANIFEST 文件名，再发布 CURRENT。
+         if(s.ok()) {
+             s=SetCurrentFile(dbname_, new_manifest_file_number);
+         }
+@@ -259,7 +282,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
+     assert(edit->has_log_number_);
+     assert(edit->log_number_ >= log_number_);
+ 
+-    current_ = v;
++    InstallVersion(v);
+     log_number_ = edit->log_number_;
+ 
+     return Status::OK();
+@@ -396,7 +419,7 @@ Status VersionSet::Recover(bool* save_manifest) {
+     }
+ 
+     // 全部恢复成功后，才发布文件视图和标量元数据。
+-    current_ = v;
++    InstallVersion(v);
+     log_number_ = recovered_log;
+     next_file_number_ = recovered_next;
+     last_sequence_ = recovered_sequence;
+diff --git a/tests/storage_safety_test.cpp b/tests/storage_safety_test.cpp
+new file mode 100644
+index 0000000..4af2bd5
+--- /dev/null
++++ b/tests/storage_safety_test.cpp
+@@ -0,0 +1,297 @@
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <iostream>
++#include <memory>
++#include <mutex>
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++#include <cerrno>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include "db_impl.h"
++#include "version_set.h"
++#include "table_builder.h"
++#include "coding.h"
++
++using namespace minidb;
++namespace fs = std::filesystem;
++namespace {
++struct Event { std::string kind, path; };
++std::mutex event_mutex;
++std::vector<Event> events;
++std::string fail_dir;
++int fail_countdown = 0;
++std::atomic<bool> injected{false};
++void Check(bool ok, const std::string& message) {
++    if (!ok) throw std::runtime_error(message);
++}
++void Ok(const Status& s) { Check(s.ok(), s.ToString()); }
++struct TempDir {
++    std::string path;
++    TempDir() {
++        char pattern[] = "/tmp/mini-lsm-safety-XXXXXX";
++        char* p = mkdtemp(pattern);
++        Check(p != nullptr, "mkdtemp");
++        path = p;
++    }
++    ~TempDir() { fs::remove_all(path); }
++};
++void Record(const std::string& kind, const std::string& path) {
++    std::lock_guard<std::mutex> lock(event_mutex);
++    events.push_back({kind, path});
++}
++void Reset(const std::string& dir = "", int count = 0) {
++    std::lock_guard<std::mutex> lock(event_mutex);
++    events.clear(); fail_dir = dir; fail_countdown = count; injected = false;
++}
++std::vector<Event> Events() {
++    std::lock_guard<std::mutex> lock(event_mutex);
++    return events;
++}
++std::unique_ptr<DB> Open(const std::string& path, Options options = Options()) {
++    options.create_if_missing = true;
++    DB* raw = nullptr;
++    Ok(DB::Open(options, path, &raw));
++    return std::unique_ptr<DB>(raw);
++}
++std::string IKey(const std::string& key, uint64_t seq = 1) {
++    std::string result = key;
++    PutFixed64(&result, (seq << 8) | kTypeValue);
++    return result;
++}
++template<class F> void Wait(F predicate) {
++    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    while (!predicate()) {
++        Check(std::chrono::steady_clock::now() < end, "background work timed out");
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    }
++}
++void TestLocks() {
++    TempDir dir;
++    auto db = Open(dir.path);
++    const auto before = fs::file_size(dir.path + "/CURRENT");
++    DB* second = nullptr;
++    Status s = DB::Open(Options(), dir.path, &second);
++    Check(!s.ok() && second == nullptr, "same-process duplicate open succeeded");
++    pid_t child = fork();
++    Check(child >= 0, "fork");
++    if (child == 0) {
++        execl("/proc/self/exe", "storage_safety_test", "--locked", dir.path.c_str(), nullptr);
++        _exit(127);
++    }
++    int status = 0;
++    Check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
++          "cross-process duplicate open succeeded");
++    Check(fs::file_size(dir.path + "/CURRENT") == before, "duplicate open modified CURRENT");
++    db.reset();
++    Check(fs::exists(dir.path + "/LOCK"), "LOCK must not be unlinked");
++    db = Open(dir.path);
++}
++void TestLiveVersions() {
++    TempDir dir;
++    Options options;
++    InternalKeyComparator cmp(options.comparator);
++    options.comparator = &cmp;
++    VersionSet versions(dir.path, &options, nullptr, &cmp);
++    const auto number = versions.NextFileNumber();
++    const std::string key = IKey("old-version-key");
++    VersionEdit add;
++    add.AddFile(0, number, 100, key, key);
++    Ok(versions.LogAndApply(&add));
++    auto old = versions.current();
++    VersionEdit remove;
++    remove.DeleteFile(0, number);
++    Ok(versions.LogAndApply(&remove));
++    std::set<uint64_t> live;
++    versions.AddLiveFiles(&live);
++    Check(live.count(number) == 1, "reader's old version lost its SST");
++    // 多次版本切换也不能丢掉仍存活的旧版本。
++    for (int i = 0; i < 3; ++i) { VersionEdit edit; Ok(versions.LogAndApply(&edit)); }
++    live.clear(); versions.AddLiveFiles(&live);
++    Check(live.count(number) == 1, "old version lost after repeated publication");
++    old.reset(); live.clear(); versions.AddLiveFiles(&live);
++    Check(live.count(number) == 0, "unreferenced version retained forever");
++}
++void TestIteratorKeepsFiles() {
++    TempDir dir;
++    Options options;
++    options.write_buffer_size = 32768;
++    options.l0_compaction_trigger = 4;
++    InternalKeyComparator cmp(options.comparator);
++    Options internal = options; internal.comparator = &cmp;
++    std::vector<std::string> originals;
++    {
++        VersionSet versions(dir.path, &internal, nullptr, &cmp);
++        VersionEdit edit;
++        for (int i = 0; i < 3; ++i) {
++            uint64_t number = versions.NextFileNumber();
++            char name[64]; std::snprintf(name, sizeof(name), "/%06llu.sst", (unsigned long long)number);
++            originals.push_back(dir.path + name);
++            WritableFile* raw = nullptr;
++            Ok(NewWritableFile(originals.back(), &raw));
++            std::unique_ptr<WritableFile> file(raw);
++            TableBuilder builder(internal, file.get());
++            std::string key = IKey("seed-key-00000001");
++            builder.Add(key, "seed"); Ok(builder.Finish()); Ok(file->Sync());
++            edit.AddFile(0, number, builder.FileSize(), key, key);
++        }
++        Ok(SyncDir(dir.path)); versions.set_last_sequence(1);
++        Ok(versions.LogAndApply(&edit));
++    }
++    auto db = Open(dir.path, options);
++    std::unique_ptr<Iterator> iterator(db->NewIterator(ReadOptions()));
++    Ok(db->Put(WriteOptions(), "write-key-0000001", std::string(65536, 'x')));
++    Ok(db->Put(WriteOptions(), "write-key-0000002", "v"));
++    auto* impl = static_cast<DBImpl*>(db.get());
++    Wait([&] {
++        std::vector<uint64_t> files, bytes;
++        impl->GetLevelFileStats(&files, &bytes);
++        return files[1] != 0 && files[0] < 4;
++    });
++    for (const auto& file : originals) Check(fs::exists(file), "iterator's old SST was deleted");
++    iterator.reset();
++    Ok(db->Put(WriteOptions(), "write-key-0000003", std::string(65536, 'y')));
++    Ok(db->Put(WriteOptions(), "write-key-0000004", "v"));
++    Wait([&] { for (const auto& file : originals) if (fs::exists(file)) return false; return true; });
++    // 验证 flush 和 compaction 输出都先同步 SST 和目录，再提交 MANIFEST。
++    const auto recorded = Events();
++    int outputs = 0;
++    for (size_t i = 0; i < recorded.size(); ++i) {
++        if (recorded[i].kind != "file" || fs::path(recorded[i].path).extension() != ".sst") continue;
++        if (recorded[i].path.find(dir.path) != 0) continue;
++        ++outputs;
++        bool synced_dir = false;
++        for (size_t j = i + 1; j < recorded.size(); ++j) {
++            if (recorded[j].kind == "dir" && recorded[j].path == dir.path) synced_dir = true;
++            if (recorded[j].kind == "file" && recorded[j].path.find(dir.path + "/MANIFEST-") == 0) {
++                Check(synced_dir, "MANIFEST synced before SST directory"); break;
++            }
++        }
++    }
++    Check(outputs >= 6, "flush/compaction SST sync paths were not exercised");
++}
++void TestPublicationOrderAndFailure() {
++    TempDir dir;
++    Reset();
++    auto db = Open(dir.path);
++    auto recorded = Events();
++    std::vector<std::string> sequence;
++    for (const auto& e : recorded) {
++        if (e.path == dir.path && e.kind == "dir") sequence.push_back("dir");
++        else if (e.path.find(dir.path + "/") == 0) {
++            if (e.kind == "rename") sequence.push_back("rename");
++            else if (fs::path(e.path).extension() == ".log") sequence.push_back("wal");
++            else if (e.path.find("/MANIFEST-") != std::string::npos) sequence.push_back("manifest");
++            else if (fs::path(e.path).filename() == "CURRENT.tmp") sequence.push_back("current");
++        }
++    }
++    Check(sequence == std::vector<std::string>({"wal", "dir", "manifest", "dir", "current", "rename", "dir"}),
++          "incorrect initial publication durability order");
++    WriteOptions write; write.sync = true;
++    Ok(db->Put(write, "recovery-key-001", "persisted"));
++    db.reset();
++    // 分别模拟 WAL、MANIFEST 目录项同步和 CURRENT rename 后目录同步失败。
++    for (int stage = 1; stage <= 3; ++stage) {
++        Reset(dir.path, stage);
++        DB* raw = nullptr;
++        Status s = DB::Open(Options(), dir.path, &raw);
++        Check(!s.ok() && raw == nullptr && injected, "directory sync error was not propagated");
++        Reset();
++        db = Open(dir.path); // 打开失败必须释放锁；重试应能恢复已有数据。
++        std::string value;
++        Ok(db->Get(ReadOptions(), "recovery-key-001", &value));
++        Check(value == "persisted", "failed publication lost old data");
++        db.reset();
++    }
++    Check(!SyncDir(dir.path + "/missing").ok(), "SyncDir accepted missing directory");
++}
++void TestWalRotationFailure() {
++    TempDir dir;
++    Options options; options.write_buffer_size = 32768; options.disable_auto_compaction = true;
++    auto db = Open(dir.path, options);
++    WriteOptions write; write.sync = true;
++    Ok(db->Put(write, "rotation-key-001", std::string(65536, 'z')));
++    Reset(dir.path, 1);
++    Check(!db->Put(write, "rotation-key-002", "value").ok() && injected,
++          "WAL rotation ignored directory sync failure");
++    Reset();
++    Ok(db->Put(write, "rotation-key-002", "value"));
++    db.reset();
++    db = Open(dir.path, options);
++    std::string value;
++    Ok(db->Get(ReadOptions(), "rotation-key-002", &value));
++    Check(value == "value", "rotation retry lost write");
++}
++void TestSstPublicationFailure() {
++    TempDir dir;
++    Options options; options.write_buffer_size = 32768; options.disable_auto_compaction = true;
++    auto db = Open(dir.path, options);
++    WriteOptions write; write.sync = true;
++    Ok(db->Put(write, "sst-failure-0001", std::string(65536, 's')));
++    // 第一次目录同步是新 WAL，第二次是后台 flush 产生的 SST。
++    Reset(dir.path, 2);
++    Ok(db->Put(write, "sst-failure-0002", "second"));
++    Wait([] { return injected.load(); });
++    Wait([&] { return !db->Put(write, "sst-failure-0003", "probe").ok(); });
++    std::vector<uint64_t> files, bytes;
++    static_cast<DBImpl*>(db.get())->GetLevelFileStats(&files, &bytes);
++    Check(files[0] == 0, "failed SST directory sync still published metadata");
++    db.reset(); Reset();
++    db = Open(dir.path, options);
++    std::string value;
++    Ok(db->Get(ReadOptions(), "sst-failure-0001", &value));
++    Check(value == std::string(65536, 's'), "failed SST publication discarded recovery WAL");
++}
++} // namespace
++
++// GNU ld syscall wrappers allow deterministic failure injection without production hooks.
++extern "C" int __real_fsync(int);
++extern "C" int __real_rename(const char*, const char*);
++extern "C" int __wrap_fsync(int fd) {
++    char link[64], path[4096];
++    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
++    ssize_t len = readlink(link, path, sizeof(path) - 1);
++    std::string filename = len >= 0 ? std::string(path, static_cast<size_t>(len)) : "";
++    struct stat st;
++    bool directory = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode);
++    {
++        std::lock_guard<std::mutex> lock(event_mutex);
++        if (directory && filename == fail_dir && fail_countdown > 0 && --fail_countdown == 0) {
++            injected = true; errno = EIO; return -1;
++        }
++    }
++    int rc = __real_fsync(fd);
++    if (rc == 0) Record(directory ? "dir" : "file", filename);
++    return rc;
++}
++extern "C" int __wrap_rename(const char* from, const char* to) {
++    int rc = __real_rename(from, to);
++    if (rc == 0) Record("rename", to);
++    return rc;
++}
++int main(int argc, char** argv) {
++    if (argc == 3 && std::string(argv[1]) == "--locked") {
++        DB* db = nullptr;
++        Status s = DB::Open(Options(), argv[2], &db);
++        delete db;
++        return !s.ok() && db == nullptr ? 0 : 1;
++    }
++    try {
++        std::cerr << "[test] locks\n"; TestLocks();
++        std::cerr << "[test] live versions\n"; TestLiveVersions();
++        std::cerr << "[test] iterator files\n"; Reset(); TestIteratorKeepsFiles();
++        std::cerr << "[test] publication\n"; TestPublicationOrderAndFailure();
++        std::cerr << "[test] WAL rotation\n"; TestWalRotationFailure();
++        std::cerr << "[test] SST failure\n"; TestSstPublicationFailure();
++        std::cout << "storage safety tests passed\n";
++    } catch (const std::exception& e) {
++        std::cerr << "FAIL: " << e.what() << '\n'; return 1;
++    }
++}

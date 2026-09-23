@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <set>
 #include "status.h"
 #include "slice.h"
 #include "version_edit.h"
@@ -81,6 +82,9 @@ public:
 
     std::shared_ptr<Version> current() const { return current_; }
 
+    // 与版本发布一样，由调用者持有 DB mutex；包括正在被旧读请求使用的版本。
+    void AddLiveFiles(std::set<uint64_t>* live);
+
     // PickCompaction 根据当前各层文件状况选取一次 compaction 任务。
     // 若不需要 compaction 则返回 nullptr。
     // 触发条件：L0 文件数 >= l0_compaction_trigger，或 L1+ 总字节数超出阈值。
@@ -114,7 +118,9 @@ private:
     uint64_t last_sequence_;
     uint64_t log_number_;
 
+    void InstallVersion(std::shared_ptr<Version> version);
     std::shared_ptr<Version> current_;
+    std::vector<std::weak_ptr<Version>> versions_;
 
     WritableFile*  descriptor_file_;
     log::Writer*   descriptor_log_;
