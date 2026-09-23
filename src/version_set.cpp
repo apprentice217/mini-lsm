@@ -5,6 +5,9 @@
 #include "log_reader.h"
 #include "env.h"
 #include "db_format.h"
+#include <filesystem>
+#include <memory>
+#include <system_error>
 #include <fstream>
 #include <cstdio>
 #include <set>
@@ -30,6 +33,10 @@ static Status SetCurrentFile(const std::string& dbname, uint64_t descriptor_numb
     out << manifest_filename << "\n";
     out.close();
 
+    if(!out) {
+        return Status::IOError("Cannot write CURRENT.tmp");
+    }
+
     // rename 是 POSIX 保证的原子操作，写完临时文件再 rename 可避免 CURRENT 写到一半崩溃。
     if (std::rename(tmp.c_str(), current.c_str()) != 0) {
         return Status::IOError("Cannot rename CURRENT.tmp to CURRENT");
@@ -40,7 +47,7 @@ static Status SetCurrentFile(const std::string& dbname, uint64_t descriptor_numb
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
                        TableCache* table_cache, const Comparator* cmp)
     : dbname_(dbname),
-      options_(options),
+      options_(*options),
       table_cache_(table_cache),
       icmp_(cmp),
       next_file_number_(2),      // 1 号预留给 MANIFEST
@@ -70,6 +77,30 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
     if(!edit->has_log_number_) {
         edit->SetLogNumber(log_number_);
     }
+    const bool create_manifest = descriptor_log_ == nullptr;
+    uint64_t new_manifest_file_number = manifest_file_number_;
+    std::string new_manifest_file_path;
+
+    if(create_manifest) {
+        for(;;) {
+            new_manifest_file_number = NextFileNumber();
+
+            char name[64];
+            std::snprintf(name, sizeof(name), "MANIFEST-%06llu",
+                          static_cast<unsigned long long>(new_manifest_file_number));
+                          
+            new_manifest_file_path = dbname_ + "/" + name;
+
+            std::error_code ec;
+            const bool exists = std::filesystem::exists(new_manifest_file_path, ec);
+            if(ec) {
+                return Status::IOError("Cannot check MANIFEST path ");
+            }
+            if (!exists) 
+                break;
+        }
+    }
+
     edit->SetNextFile(next_file_number_);
     edit->SetLastSequence(last_sequence_);
 
@@ -108,48 +139,88 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
     }
 
     // 将 VersionEdit 序列化后追加到 MANIFEST 日志。
-    std::string record;
-    edit->EncodeTo(&record);
-
     Status s;
-    if (descriptor_log_ == nullptr) {
-        char buf[100];
-        std::snprintf(buf, sizeof(buf), "%s/MANIFEST-%06llu",
-                      dbname_.c_str(), (unsigned long long)manifest_file_number_);
-        s = NewWritableFile(buf, &descriptor_file_);
-        if (!s.ok()) return s;
-        descriptor_log_ = new log::Writer(descriptor_file_);
+
+    if(create_manifest) {
+        VersionEdit snapshot;
+        snapshot.SetLogNumber(log_number_);
+        snapshot.SetNextFile(next_file_number_);
+        snapshot.SetLastSequence(last_sequence_);
+
+        for(int level = 0; level < kNumLevels; ++level) {
+            for(const auto& file : v->files_[level]) {
+                snapshot.AddFile(
+                    level, 
+                    file->number, 
+                    file->file_size,
+                    Slice(file->smallest), 
+                    Slice(file->largest));
+            }
+        }
+
+        std::string record;
+        snapshot.EncodeTo(&record);
+
+        WritableFile* raw_file = nullptr;
+        s=NewWritableFile(new_manifest_file_path, &raw_file);
+        if(!s.ok()) return s;
+
+        std::unique_ptr<WritableFile> new_file(raw_file);
+        auto new_log = std::make_unique<log::Writer>(new_file.get());
+
+        s=new_log->AddRecord(Slice(record));
+
+        if(s.ok()) {
+            s=new_file->Sync();
+        }
+        if(s.ok()) {
+            s=SetCurrentFile(dbname_, new_manifest_number);
+        }
+        if(!s.ok()) return s;
+
+        // 新 MANIFEST 发布成功后，才接管这些对象。
+        descriptor_file_ = new_file.release();
+        descriptor_log_ = new_log.release();
+        manifest_file_number_ = new_manifest_number;
+    } else {
+         // 已有完整基础状态，后续只追加本次增量。
+        std::string record;
+        edit->EncodeTo(&record);
+
+        s = descriptor_log_->AddRecord(Slice(record));
+        if (s.ok()) {
+            s = descriptor_file_->Sync();
+        }
+        if (!s.ok()) {
+            return s;
+        }
     }
 
-    s = descriptor_log_->AddRecord(record);
-    if (s.ok()) {
-        // fsync 确保 MANIFEST 记录在崩溃时不丢失。
-        s = descriptor_file_->Sync();
-    }
-    if (s.ok()) {
-        s = SetCurrentFile(dbname_, manifest_file_number_);
-    }
+    assert(edit->has_log_number_);
+    assert(edit->log_number_ >= log_number_);
 
-    // 只有 MANIFEST 记录落盘且CURRENT更新成功后，
-    // 才将新 Version 设为 current_，并把内存中的 log_number_同步为本次 edit 中记录的值。
-    // 若前面补全过，则这里只是幂等更新；
-    // 若调用方显式指定了新的 log_number_，则恢复起点在此刻正式生效。
-    if (s.ok()) {
-        assert(edit->has_log_number_);
-        assert(edit->log_number_>= log_number_); // 正常情况下log_number_应该单调不减,这里加一个断言，防止log_number_回退
-        current_ = v;
-        log_number_ = edit->log_number_;
-    }
+    current_ = v;
+    log_number_ = edit->log_number_;
 
-    return s;
+    return Status::OK();
 }
 
 // Recover 从 CURRENT -> MANIFEST 链重建版本集合，恢复上次关闭时的文件视图。
 Status VersionSet::Recover(bool* save_manifest) {
     std::string current_path = dbname_ + "/CURRENT";
+
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(current_path, ec);
+    if(ec) {
+        return Status::IOError("Cannot check CURRENT file ");
+    }
+    if(!exists) {
+        return Status::NotFound("CURRENT file does not exist.");
+    }
+
     std::ifstream in(current_path);
     if (!in.is_open()) {
-        return Status::NotFound("CURRENT file does not exist. (First boot)");
+        return Status::NotFound("Cannot open CURRENT file ");
     }
 
     std::string manifest_filename;
@@ -172,7 +243,7 @@ Status VersionSet::Recover(bool* save_manifest) {
 
     // 将所有 VersionEdit 依次重放到一个新 Version 上，最终得到最新的文件集合。
     std::shared_ptr<Version> v = std::make_shared<Version>(this);
-    std::set<std::pair<int, uint64_t>> deleted_files;
+    
 
     while (reader.ReadRecord(&record, &scratch)) {
         VersionEdit edit;
@@ -184,24 +255,67 @@ Status VersionSet::Recover(bool* save_manifest) {
         if (edit.has_last_sequence_)    last_sequence_    = edit.last_sequence_;
 
         for (const auto& del : edit.deleted_files_) {
-            deleted_files.insert(del);
-        }
-        for (const auto& new_file_pair : edit.new_files_) {
-            int level = new_file_pair.first;
-            std::pair<int, uint64_t> file_id =
-                std::make_pair(level, new_file_pair.second.number);
-            if (deleted_files.find(file_id) == deleted_files.end()) {
-                v->files_[level].push_back(
-                    std::make_shared<FileMetaData>(new_file_pair.second));
+            const int level = del.first;
+            const uint64_t number = del.second;
+
+            if(level < 0 || level >= kNumLevels) {
+                s = Status::Corruption("Invalid level in deleted_files");
+                break;
             }
+
+            auto& files = v->files_[level];
+            files.erase(std::remove_if(files.begin(), files.end(),
+                                       [number](const std::shared_ptr<FileMetaData>& file) {
+                                           return file->number == number;
+                                       }),
+                        files.end());
+        }
+
+        if(!s.ok()) break;
+
+        for (const auto& added : edit.new_files_) {
+            const int level = added.first;
+            if(level < 0 || level >= kNumLevels) {
+                s = Status::Corruption("Invalid level in new_files");
+                break;
+            }
+
+            const auto& metadata = added.second;
+            auto& files = v->files_[level];
+
+            // 同一层的同一文件编号只保留一份
+            files.erase(std::remove_if(files.begin(), files.end(),
+                               [&metadata](const std::shared_ptr<FileMetaData>& file) {
+                                   return file->number == metadata.number;
+                               }),
+                    files.end());
+            
+            files.push_back(std::make_shared<FileMetaData>(metadata));
         }
     }
+    
+    if(!s.ok()) break;
 
     delete manifest_file;
 
     if (s.ok()) {
-        current_       = v;
-        *save_manifest = false;
+         // L1 及以上的读路径依赖文件边界有序。
+        for (int level = 1; level < kNumLevels; ++level) {
+            auto& files = v->files_[level];
+            std::sort(
+                files.begin(), files.end(),
+                [this](const std::shared_ptr<FileMetaData>& a,
+                    const std::shared_ptr<FileMetaData>& b) {
+                    return icmp_->Compare(
+                        Slice(a->smallest), Slice(b->smallest)) < 0;
+            });
+        }
+        current_ = v;
+
+        // 恢复后没有继续打开旧 MANIFEST 写入，
+        // 后续首次 LogAndApply 需要创建新的 MANIFEST。
+        *save_manifest = true;
+
     }
 
     return s;
@@ -213,7 +327,7 @@ Status VersionSet::Recover(bool* save_manifest) {
 
 int64_t VersionSet::MaxBytesForLevel(int level) const {
     // L1 = max_bytes_for_level_base，每向上一级乘以 10。
-    int64_t result = options_->max_bytes_for_level_base;
+    int64_t result = options_.max_bytes_for_level_base;
     while (level > 1) {
         result *= 10;
         --level;
@@ -233,7 +347,7 @@ int64_t VersionSet::TotalFileSize(int level) const {
 bool VersionSet::NeedsCompaction() const {
     if (current_ == nullptr) return false;
     // L0：文件数超阈值。
-    if (static_cast<int>(current_->files_[0].size()) >= options_->l0_compaction_trigger) {
+    if (static_cast<int>(current_->files_[0].size()) >= options_.l0_compaction_trigger) {
         return true;
     }
     // L1-L6：总字节数超阈值。
@@ -277,7 +391,7 @@ Compaction* VersionSet::PickCompaction() {
     int level = -1;
 
     // 优先检查 L0：文件数过多会拖慢读性能（需要检查每个文件的 Bloom Filter）。
-    if (static_cast<int>(current_->files_[0].size()) >= options_->l0_compaction_trigger) {
+    if (static_cast<int>(current_->files_[0].size()) >= options_.l0_compaction_trigger) {
         level = 0;
     } else {
         // 检查 L1-L5 是否有层的总字节数超出阈值。

@@ -105,7 +105,7 @@ private:
                               std::vector<std::shared_ptr<FileMetaData>>* inputs);
 
     std::string       dbname_;
-    const Options*    options_;
+    const Options     options_;
     TableCache*       table_cache_;
     const Comparator* icmp_;
 

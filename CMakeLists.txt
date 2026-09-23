@@ -6,7 +6,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # 保持严苛警告，加入 -fPIC 确保静态库在被其他动态库链接时不会报错
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror=return-type -g")
+if(MSVC)
+    # MSVC 风格的警告与调试信息
+    # /W4      ≈ -Wall -Wextra
+    # /we4715  把“并非所有控制路径都返回值”当成错误，≈ -Werror=return-type
+    # /Zi      生成调试信息，≈ -g
+    add_compile_options(/W4 /we4715 /Zi)
+else()
+    # GCC / Clang 风格
+    add_compile_options(-Wall -Wextra -Werror=return-type -g)
+endif()
 
 find_package(Threads REQUIRED)
 
