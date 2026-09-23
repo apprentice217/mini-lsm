@@ -53,7 +53,7 @@ private:
     };
 
     bool has_log_number_;
-    uint64_t log_number_; // 当前正在使用的 WAL 编号
+    uint64_t log_number_; // 恢复时仍需回放的最早WAL编号
 
     bool has_next_file_number_;
     uint64_t next_file_number_; // 用于分配给下一个生成的 .sst 或 .log 的编号

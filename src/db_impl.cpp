@@ -1,5 +1,6 @@
 #include <iostream>
 #include <thread>
+#include <memory>
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
@@ -125,10 +126,15 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
 
         s = NewWritableFile(buf, (WritableFile**)&logfile_);
         if (s.ok()) {
-            log_ = new log::Writer((WritableFile*)logfile_);
+            log_ = new log::Writer(logfile_);
             VersionEdit edit;
-            edit.SetLogNumber(new_log_number);
+
+            const uint64_t recovery_log_number = versions_->log_number() == 0? new_log_number : versions_->log_number();
+            edit.SetLogNumber(recovery_log_number);
             s = versions_->LogAndApply(&edit);
+            if(s.ok()) {
+                active_log_number_ = new_log_number;
+            }
         }
     }
 
@@ -187,7 +193,7 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     std::unique_lock<std::mutex> lock(mutex_); // 创建一个锁管理对象，并立刻尝试锁住当前数据库实例的mutex_
 
-    Status s = MakeRoomForWrite(lock); // 检查当前内存表是否可以继续接收写入，它检查的是当前占用，没有根据即将写入的整个批次预留空间
+    Status s = MakeRoomForWrite(lock); // 在写入前检查当前内存表是否超过阈值；超过时等待或切换内存表。
     if (!s.ok()) return s;
 
     uint64_t seq = last_sequence_ + 1;
@@ -239,6 +245,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
 // 若 imm_ 尚未 flush 完毕，阻塞前台写线程，避免内存无限膨胀（背压机制）。
 Status DBImpl::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {
     while (true) {
+        if(!background_error_.ok()) {
+            return background_error_;
+        }
         if (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size) {
             return Status::OK();
         } else if (imm_ != nullptr) {
@@ -250,24 +259,44 @@ Status DBImpl::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {
             char buf[100];
             std::snprintf(buf, sizeof(buf), "%s/%06llu.log",
                           dbname_.c_str(), (unsigned long long)new_log_number);
+            // 先准备新对象，暂时不修改数据库正在使用的对象
+            auto new_mem = std::make_unique<MemTable>(&internal_comparator_);
 
-            WritableFile* new_logfile = nullptr;
-            Status s = NewWritableFile(buf, &new_logfile);
+            WritableFile* raw_file=nullptr;
+            Status s = NewWritableFile(buf, &raw_file);
+            std::unique_ptr<WritableFile> new_file(raw_file);
+
             if (!s.ok()) return s;
 
-            delete log_;
-            delete logfile_;
-            logfile_ = new_logfile;
-            log_     = new log::Writer(logfile_);
+            auto new_log = std::make_unique<log::Writer>(new_file.get());
 
-            // 将新 WAL 编号持久化到 MANIFEST，崩溃恢复时据此判断哪些日志需要回放。
+            // 保留当前恢复起点。
+            // LogAndApply 会记录 next_file_number_ 等信息，
+            // 使新 WAL 的编号分配进度得到保存。
             VersionEdit edit;
-            edit.SetLogNumber(new_log_number);
             s = versions_->LogAndApply(&edit);
-            if (!s.ok()) return s;
+            if (!s.ok()) {
+                if(background_error_.ok()) {
+                    background_error_ = s;
+                }
+                bg_cv_.notify_all(); // 唤醒可能被阻塞的前台写线程，让它们感知错误并返回。
+                return s;
+            }
+
+            // 准备和元数据提交成功后，再替换共享状态。
+            log::Writer* old_log = log_;
+            WritableFile* old_file = logfile_;
 
             imm_ = mem_;
-            mem_ = new MemTable(&internal_comparator_);
+            mem_ = new_mem.release();
+
+            logfile_ = new_file.release();
+            log_ = new_log.release();
+            active_log_number_ = new_log_number;
+
+            delete old_log;
+            delete old_file;
+
             MaybeScheduleCompaction();
         }
     }
@@ -275,7 +304,7 @@ Status DBImpl::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {
 
 void DBImpl::MaybeScheduleCompaction() {
     // 约定：调用方必须持有 mutex_。
-    if (bg_compaction_scheduled_ || shutting_down_) return;
+    if (bg_compaction_scheduled_ || shutting_down_ || !background_error_.ok()) return;
     // imm_ 不为空时必须优先 flush；imm_ 为空时仅在需要且允许自动 compaction 时调度。
     if (imm_ == nullptr) {
         if (options_.disable_auto_compaction || !versions_->NeedsCompaction()) {
@@ -320,7 +349,10 @@ void DBImpl::BackgroundCompaction() {
             DeleteObsoleteFiles();
         } else {
             std::cerr << "[ERROR] MemTable flush failed: " << s.ToString() << "\n";
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if(background_error_.ok()) {
+                background_error_ = s;
+            }
+            bg_cv_.notify_all(); // 唤醒可能被阻塞的前台写线程，让它们感知错误并返回。
             return;
         }
     }
@@ -336,7 +368,11 @@ void DBImpl::BackgroundCompaction() {
         delete c;
         if (!s.ok()) {
             std::cerr << "[ERROR] Level compaction failed: " << s.ToString() << "\n";
-            break;
+            if(background_error_.ok()) {
+                background_error_ = s;
+            }
+            bg_cv_.notify_all(); // 唤醒可能被阻塞的前台写线程，让它们感知错误并返回。
+            return;
         }
         DeleteObsoleteFiles();
     }
@@ -392,6 +428,12 @@ Status DBImpl::CompactMemTable() {
         VersionEdit edit;
         edit.AddFile(0, file_number, file_size, Slice(smallest_key), Slice(largest_key));
         s = versions_->LogAndApply(&edit);
+
+        // 旧表已经写成SSTable。
+        // 将“登记新文件”和“推进恢复起点”放在同一次提交中。
+        edit.SetLogNumber(active_log_number_);
+
+        s=versions_->LogAndApply(&edit);
     }
 
     return s;

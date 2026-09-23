@@ -75,6 +75,10 @@ private:
     bool                    shutting_down_;
     bool                    bg_compaction_scheduled_;
 
+    // 保存首次导致数据库无法安全继续写入的错误。
+    // 读取和修改时必须持有 mutex_。
+    Status background_error_; 
+
     // 全局逻辑时钟，单调递增，每条写入操作消耗一个序列号，受 mutex_ 保护。
     uint64_t last_sequence_;
 
@@ -83,6 +87,10 @@ private:
 
     WritableFile*  logfile_;
     log::Writer*   log_;
+
+    // 当前写入使用的 WAL 编号。
+    // 与 VersionSet::log_number() 表示的恢复起点分开。
+    uint64_t active_log_number_=0;
 
     std::thread bg_thread_;
 

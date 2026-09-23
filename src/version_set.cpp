@@ -62,10 +62,12 @@ VersionSet::~VersionSet() {
 // 2. 将本次变更（VersionEdit）序列化追加到 MANIFEST；
 // 3. 刷盘确认后才切换 current_ 指针，保证持久化先于内存可见。
 Status VersionSet::LogAndApply(VersionEdit* edit) {
-    // 补全 edit 中缺失的全局水位信息，确保 MANIFEST 记录完整。
-    if (edit->has_log_number_) {
-        log_number_ = edit->log_number_;
-    } else {
+    // VersionEdit 中的 log_number 是可选字段：
+    // 若调用方未显式设置，说明本次变更不打算修改恢复起点。
+    // 这里只把当前已生效的 log_number_ 补进这个待提交的 edit，
+    // 使其写入 MANIFEST 后仍沿用原值。
+    // 注意：这里只修改 edit，不修改 VersionSet 当前已生效的状态。
+    if(!edit->has_log_number_) {
         edit->SetLogNumber(log_number_);
     }
     edit->SetNextFile(next_file_number_);
@@ -128,9 +130,15 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
         s = SetCurrentFile(dbname_, manifest_file_number_);
     }
 
-    // 只有磁盘确认成功后，才将新 Version 设为 current_。
+    // 只有 MANIFEST 记录落盘且CURRENT更新成功后，
+    // 才将新 Version 设为 current_，并把内存中的 log_number_同步为本次 edit 中记录的值。
+    // 若前面补全过，则这里只是幂等更新；
+    // 若调用方显式指定了新的 log_number_，则恢复起点在此刻正式生效。
     if (s.ok()) {
+        assert(edit->has_log_number_);
+        assert(edit->log_number_>= log_number_); // 正常情况下log_number_应该单调不减,这里加一个断言，防止log_number_回退
         current_ = v;
+        log_number_ = edit->log_number_;
     }
 
     return s;
